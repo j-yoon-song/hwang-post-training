@@ -191,6 +191,14 @@ def load_config(path: str | Path) -> PipelineConfig:
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     cfg = _coerce_dataclass(PipelineConfig, payload)
 
+    # Backward-compatible aliases from older specs/examples.
+    lang_alias = {
+        "eng": "en",
+        "kor": "ko",
+    }
+    cfg.data.src_lang = lang_alias.get(cfg.data.src_lang, cfg.data.src_lang)
+    cfg.data.tgt_lang = lang_alias.get(cfg.data.tgt_lang, cfg.data.tgt_lang)
+
     dataset_name = cfg.data.madlad_dataset.strip()
     if "allendai/" in dataset_name.lower():
         raise ValueError(

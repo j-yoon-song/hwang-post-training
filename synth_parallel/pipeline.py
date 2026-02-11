@@ -209,11 +209,17 @@ class PipelineRunner:
                     "Failed to access MADLAD due to Hugging Face rate limit. "
                     f"Set {self.cfg.data.hf_token_env} and retry."
                 ) from exc
+            if "dataset scripts are no longer supported" in msg:
+                raise RuntimeError(
+                    "Your datasets package is too new for MADLAD dataset script loading. "
+                    "Use datasets<3 (e.g. 2.21.x) in your runtime environment."
+                ) from exc
             if "datafilesnotfounderror" in type(exc).__name__.lower() or "no (supported) data files found" in msg:
                 raise RuntimeError(
                     "MADLAD files could not be resolved. "
                     "Check data.madlad_dataset='allenai/MADLAD-400', "
-                    "data.src_lang (e.g. en/ko), and ensure HF token is configured."
+                    "data.src_lang (e.g. en/ko), and ensure HF token is configured. "
+                    f"Original error: {type(exc).__name__}: {exc}"
                 ) from exc
             raise
 
