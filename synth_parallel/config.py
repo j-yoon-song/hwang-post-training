@@ -16,10 +16,10 @@ class RunConfig:
 
 @dataclass
 class DataConfig:
-    madlad_dataset: str = "allenai/madlad-400"
+    madlad_dataset: str = "allenai/MADLAD-400"
     madlad_split: str = "clean"
-    src_lang: str = "kor"
-    tgt_lang: str = "eng"
+    src_lang: str = "ko"
+    tgt_lang: str = "en"
     src_lang_name: str = "Korean"
     tgt_lang_name: str = "English"
     target_examples_total: int = 10_000

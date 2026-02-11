@@ -7,7 +7,7 @@ setup(
     packages=find_packages(exclude=("tests", "tests.*")),
     include_package_data=True,
     install_requires=[
-        "datasets>=2.19.0",
+        "datasets>=2.19.0,<3.0.0",
         "openai>=1.40.0",
         "PyYAML>=6.0.1",
         "tqdm>=4.66.0",

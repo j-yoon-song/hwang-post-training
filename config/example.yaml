@@ -4,10 +4,10 @@ run:
   log_level: INFO
 
 data:
-  madlad_dataset: allenai/madlad-400
+  madlad_dataset: allenai/MADLAD-400
   madlad_split: clean
-  src_lang: kor
-  tgt_lang: eng
+  src_lang: ko
+  tgt_lang: en
   src_lang_name: Korean
   tgt_lang_name: English
   target_examples_total: 10000

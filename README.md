@@ -44,6 +44,8 @@ TranslateGemma 방식(MADLAD-400 -> prefilter 2-sample -> final 128-sample -> Me
 
 ### 4.1 메인 파이프라인 환경
 
+참고: MADLAD-400은 Hugging Face `datasets`의 dataset script(`MADLAD-400.py`)를 사용합니다. `datasets` 4.x에서는 dataset script 로딩이 중단되어 MADLAD 로딩이 실패할 수 있으므로, 이 레포는 `datasets` 2.x(`datasets<3`)를 사용합니다.
+
 ```bash
 # uv 설치 (없다면)
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -102,6 +104,10 @@ source .venv/bin/activate
 - API 키를 읽을 환경변수 이름 (기본: `QWEN_API_KEY`)
 - `teacher.model`
 - 호출할 model 이름
+- `data.madlad_dataset`
+- 기본값: `allenai/MADLAD-400`
+- `data.src_lang`
+- MADLAD config name (예: 한국어는 `ko`)
 - `metricx.backend`
 - `metricx24_cli` 사용
 - `metricx.device`
@@ -135,9 +141,37 @@ metricx:
 export QWEN_API_KEY="<your-api-key>"
 ```
 
-## 6. 실행 방법
+## 6. MADLAD 다운로드/캐시 (CPU)
 
-### 6.1 먼저 소규모 검증
+다운로드 자체는 GPU가 필요 없습니다. CPU 머신에서 Hugging Face 캐시를 미리 채워두면, 이후 파이프라인 실행 시 재다운로드를 줄일 수 있습니다.
+
+1) 캐시 위치 지정(권장)
+
+```bash
+export HF_HOME=/path/to/hf-cache
+```
+
+2) 언어/스플릿 선택해서 다운로드
+
+예: 한국어 clean 전체를 로컬 캐시에 받기
+
+```bash
+python - <<'PY'
+from datasets import load_dataset
+
+ds = load_dataset('allenai/MADLAD-400', 'ko', split='clean', streaming=False)
+print(ds)
+PY
+```
+
+주의:
+- 한국어는 clean만 받아도 약 34GiB(압축) 규모입니다(추가 전처리 캐시까지 감안해 여유 디스크 필요).
+- 전체(모든 언어)는 1TiB+ 입니다.
+- 완전 다운로드가 아니라면 `streaming: true`로 두고 파이프라인이 스트리밍으로 읽도록 운영하는 편이 안전합니다.
+
+## 7. 실행 방법
+
+### 7.1 먼저 소규모 검증
 
 ```bash
 python -m synth_parallel.cli run \
@@ -148,7 +182,7 @@ python -m synth_parallel.cli run \
   --overwrite
 ```
 
-### 6.2 본 실행
+### 7.2 본 실행
 
 ```bash
 python -m synth_parallel.cli run \
@@ -157,7 +191,7 @@ python -m synth_parallel.cli run \
   --resume
 ```
 
-### 6.3 stage 단독 실행
+### 7.3 stage 단독 실행
 
 ```bash
 python -m synth_parallel.cli run --config config/example.yaml --stage sample_sources
@@ -169,7 +203,7 @@ python -m synth_parallel.cli run --config config/example.yaml --stage format_fil
 python -m synth_parallel.cli run --config config/example.yaml --stage export
 ```
 
-### 6.4 공통 옵션
+### 7.4 공통 옵션
 
 - `--resume`: 진행 DB 기준으로 미처리 항목만 수행
 - `--overwrite`: 해당 stage 출력 파일 초기화 후 재실행
@@ -177,7 +211,7 @@ python -m synth_parallel.cli run --config config/example.yaml --stage export
 - `--dry-run`: 내부 기본 소량 제한 적용
 - `--shard-id`, `--num-shards`: 샤드 분산 실행
 
-## 7. 산출물
+## 8. 산출물
 
 `run.out_dir` 아래 생성:
 
@@ -193,7 +227,7 @@ python -m synth_parallel.cli run --config config/example.yaml --stage export
 - `resolved_config.yaml`
 - `manifest.json`
 
-## 8. 로그, 통계, 캐시, 복구
+## 9. 로그, 통계, 캐시, 복구
 
 - `logs.txt`
 - stage 시작/종료, 진행률, 에러, 재시도 로그
@@ -208,14 +242,14 @@ python -m synth_parallel.cli run --config config/example.yaml --stage export
 
 중단 후 동일 커맨드에 `--resume`를 주면 이어서 처리됩니다.
 
-## 9. 운영 팁
+## 10. 운영 팁
 
 - 대규모 실행 전 반드시 dry-run으로 API/MetricX 연결 확인
 - `sample_pool_size`, `target_examples_total`, `num_candidates`를 작게 줄여 비용/시간 예측
 - MetricX GPU 고정은 `metricx.device: cuda:0` 사용
 - 샤딩 시 모든 워커가 같은 입력/설정 버전을 사용해야 재현성 유지
 
-## 10. 트러블슈팅
+## 11. 트러블슈팅
 
 - `metricx24.predict` 실행 실패
 - `metricx.python_bin` 경로 확인
@@ -229,7 +263,7 @@ python -m synth_parallel.cli run --config config/example.yaml --stage export
 - `metricx.device` 값(`cuda:0`) 확인
 - 드라이버/CUDA/torch 호환성 점검
 
-## 11. 테스트
+## 12. 테스트
 
 ```bash
 source .venv/bin/activate
