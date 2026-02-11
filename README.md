@@ -124,6 +124,8 @@ source .venv/bin/activate
 - MADLAD config name (예: 한국어는 `ko`)
 - `data.hf_token_env`
 - Hugging Face 토큰 env 이름 (기본 `HF_TOKEN`)
+- `data.trust_remote_code`
+- MADLAD dataset script 로딩 허용 여부 (기본 `true`)
 - `metricx.backend`
 - `metricx24_cli` 사용
 - `metricx.device`

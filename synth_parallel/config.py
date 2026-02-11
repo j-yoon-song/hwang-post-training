@@ -24,6 +24,7 @@ class DataConfig:
     tgt_lang_name: str = "Korean"
     hf_token_env: str = "HF_TOKEN"
     madlad_revision: str | None = None
+    trust_remote_code: bool = True
     target_examples_total: int = 10_000
     sample_pool_size: int = 1_000_000
     text_field: str = "text"
@@ -190,6 +191,12 @@ def load_config(path: str | Path) -> PipelineConfig:
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     cfg = _coerce_dataclass(PipelineConfig, payload)
 
+    dataset_name = cfg.data.madlad_dataset.strip()
+    if "allendai/" in dataset_name.lower():
+        raise ValueError(
+            "data.madlad_dataset has a typo: 'allendai'. "
+            "Use 'allenai/MADLAD-400'."
+        )
     if cfg.data.madlad_split not in _ALLOWED_SPLITS:
         raise ValueError(f"data.madlad_split must be one of {_ALLOWED_SPLITS}")
     if cfg.data.sample_pool_size <= 0:

@@ -189,6 +189,7 @@ class PipelineRunner:
         load_kwargs: dict[str, Any] = {
             "split": self.cfg.data.madlad_split,
             "streaming": self.cfg.data.streaming,
+            "trust_remote_code": self.cfg.data.trust_remote_code,
         }
         if token:
             load_kwargs["token"] = token
