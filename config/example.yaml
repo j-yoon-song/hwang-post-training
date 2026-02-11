@@ -13,6 +13,7 @@ data:
   hf_token_env: HF_TOKEN
   madlad_revision:
   trust_remote_code: true
+  local_data_glob:
   target_examples_total: 10000
   sample_pool_size: 1000000
   text_field: text

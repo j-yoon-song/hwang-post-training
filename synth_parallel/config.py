@@ -25,6 +25,7 @@ class DataConfig:
     hf_token_env: str = "HF_TOKEN"
     madlad_revision: str | None = None
     trust_remote_code: bool = True
+    local_data_glob: str | None = None
     target_examples_total: int = 10_000
     sample_pool_size: int = 1_000_000
     text_field: str = "text"

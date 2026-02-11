@@ -126,6 +126,8 @@ source .venv/bin/activate
 - Hugging Face 토큰 env 이름 (기본 `HF_TOKEN`)
 - `data.trust_remote_code`
 - MADLAD dataset script 로딩 허용 여부 (기본 `true`)
+- `data.local_data_glob`
+- 로컬에 미리 받은 jsonl.gz 파일을 직접 읽을 glob 패턴. 설정하면 Hub의 MADLAD script 로딩을 우회함.
 - `metricx.backend`
 - `metricx24_cli` 사용
 - `metricx.device`
@@ -194,6 +196,31 @@ PY
 - 한국어는 clean만 받아도 약 34GiB(압축) 규모입니다(추가 전처리 캐시까지 감안해 여유 디스크 필요).
 - 전체(모든 언어)는 1TiB+ 입니다.
 - 완전 다운로드가 아니라면 `streaming: true`로 두고 파이프라인이 스트리밍으로 읽도록 운영하는 편이 안전합니다.
+
+### 6.1 MADLAD script 로딩이 계속 실패할 때(우회)
+
+아래처럼 Hugging Face에서 shard를 로컬로 먼저 받고, 파이프라인은 로컬 jsonl.gz를 직접 읽게 할 수 있습니다.
+
+```bash
+python - <<'PY'
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id='allenai/MADLAD-400',
+    repo_type='dataset',
+    allow_patterns=['data/en/en_clean_*.jsonl.gz'],
+    local_dir='./madlad_local',
+    token=True,  # HF_TOKEN 사용
+)
+print('done')
+PY
+```
+
+그리고 config에:
+
+```yaml
+data:
+  local_data_glob: ./madlad_local/data/en/en_clean_*.jsonl.gz
+```
 
 ## 7. 실행 방법
 

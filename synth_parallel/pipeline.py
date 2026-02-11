@@ -185,43 +185,53 @@ class PipelineRunner:
             self.cfg.data.madlad_split,
             self.cfg.data.streaming,
         )
-        token = os.getenv(self.cfg.data.hf_token_env, "").strip()
-        load_kwargs: dict[str, Any] = {
-            "split": self.cfg.data.madlad_split,
-            "streaming": self.cfg.data.streaming,
-            "trust_remote_code": self.cfg.data.trust_remote_code,
-        }
-        if token:
-            load_kwargs["token"] = token
-        if self.cfg.data.madlad_revision:
-            load_kwargs["revision"] = self.cfg.data.madlad_revision
-
-        try:
+        if self.cfg.data.local_data_glob:
+            logger.info("Using local MADLAD files from glob=%s", self.cfg.data.local_data_glob)
             dataset = load_dataset(
-                self.cfg.data.madlad_dataset,
-                self.cfg.data.src_lang,
-                **load_kwargs,
+                "json",
+                data_files=self.cfg.data.local_data_glob,
+                split="train",
+                streaming=self.cfg.data.streaming,
             )
-        except Exception as exc:  # pylint: disable=broad-except
-            msg = str(exc).lower()
-            if "429" in msg or "rate limit" in msg:
-                raise RuntimeError(
-                    "Failed to access MADLAD due to Hugging Face rate limit. "
-                    f"Set {self.cfg.data.hf_token_env} and retry."
-                ) from exc
-            if "dataset scripts are no longer supported" in msg:
-                raise RuntimeError(
-                    "Your datasets package is too new for MADLAD dataset script loading. "
-                    "Use datasets<3 (e.g. 2.21.x) in your runtime environment."
-                ) from exc
-            if "datafilesnotfounderror" in type(exc).__name__.lower() or "no (supported) data files found" in msg:
-                raise RuntimeError(
-                    "MADLAD files could not be resolved. "
-                    "Check data.madlad_dataset='allenai/MADLAD-400', "
-                    "data.src_lang (e.g. en/ko), and ensure HF token is configured. "
-                    f"Original error: {type(exc).__name__}: {exc}"
-                ) from exc
-            raise
+        else:
+            token = os.getenv(self.cfg.data.hf_token_env, "").strip()
+            load_kwargs: dict[str, Any] = {
+                "split": self.cfg.data.madlad_split,
+                "streaming": self.cfg.data.streaming,
+                "trust_remote_code": self.cfg.data.trust_remote_code,
+            }
+            if token:
+                load_kwargs["token"] = token
+            if self.cfg.data.madlad_revision:
+                load_kwargs["revision"] = self.cfg.data.madlad_revision
+
+            try:
+                dataset = load_dataset(
+                    self.cfg.data.madlad_dataset,
+                    self.cfg.data.src_lang,
+                    **load_kwargs,
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                msg = str(exc).lower()
+                if "429" in msg or "rate limit" in msg:
+                    raise RuntimeError(
+                        "Failed to access MADLAD due to Hugging Face rate limit. "
+                        f"Set {self.cfg.data.hf_token_env} and retry."
+                    ) from exc
+                if "dataset scripts are no longer supported" in msg:
+                    raise RuntimeError(
+                        "Your datasets package is too new for MADLAD dataset script loading. "
+                        "Use datasets<3 (e.g. 2.21.x) in your runtime environment."
+                    ) from exc
+                if "datafilesnotfounderror" in type(exc).__name__.lower() or "no (supported) data files found" in msg:
+                    raise RuntimeError(
+                        "MADLAD files could not be resolved. "
+                        "Check data.madlad_dataset='allenai/MADLAD-400', "
+                        "data.src_lang (e.g. en/ko), and ensure HF token is configured. "
+                        "If this persists, predownload shards and set data.local_data_glob. "
+                        f"Original error: {type(exc).__name__}: {exc}"
+                    ) from exc
+                raise
 
         processed_docs = 0
         processed_segments = 0
