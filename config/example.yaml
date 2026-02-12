@@ -69,9 +69,9 @@ metricx:
   device: cuda:0
   cache_db: metricx_cache.sqlite
   backend: metricx24_cli
-  python_bin: ./.venv-metricx/bin/python
+  python_bin: ../.venv-metricx/bin/python
   module: metricx24.predict
-  repo_dir: ./third_party/metricx
+  repo_dir: ../third_party/metricx
   tokenizer: google/mt5-xl
   max_input_length: 1536
 

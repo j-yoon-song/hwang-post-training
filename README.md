@@ -136,12 +136,12 @@ source .venv/bin/activate
 - `cuda:0` 권장 (H100 1장 고정)
 - `metricx.python_bin`
 - MetricX 전용 env의 Python 경로
-- 예: `./.venv-metricx/bin/python`
+- 예: `../.venv-metricx/bin/python` (`config/example.yaml` 기준)
 - 상대경로는 **config 파일 위치 기준**으로 해석
 - `metricx.module`
 - 기본 `metricx24.predict`
 - `metricx.repo_dir`
-- `google-research/metricx`를 clone한 디렉터리(예: `./third_party/metricx`)
+- `google-research/metricx`를 clone한 디렉터리(예: `../third_party/metricx`)
 - `metricx.max_input_length`
 - MetricX-24 기본 1536 권장(레포 README 예시)
 
@@ -158,9 +158,9 @@ metricx:
   backend: metricx24_cli
   checkpoint: google/metricx-24-hybrid-large-v2p6
   device: cuda:0
-  python_bin: ./.venv-metricx/bin/python
+  python_bin: ../.venv-metricx/bin/python
   module: metricx24.predict
-  repo_dir: ./third_party/metricx
+  repo_dir: ../third_party/metricx
   tokenizer: google/mt5-xl
   max_input_length: 1536
 ```
