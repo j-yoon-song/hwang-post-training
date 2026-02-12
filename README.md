@@ -118,6 +118,8 @@ source .venv/bin/activate
 - API 키를 읽을 환경변수 이름 (기본: `QWEN_API_KEY`)
 - `teacher.model`
 - 호출할 model 이름
+- `teacher.unset_proxy_env`
+- `true`면 teacher API 호출 시 `HTTP_PROXY`/`HTTPS_PROXY` 환경변수를 무시(`trust_env=False`)
 - `data.madlad_dataset`
 - 기본값: `allenai/MADLAD-400`
 - `data.src_lang`

@@ -78,6 +78,7 @@ class TeacherConfig:
     api_key_env: str = "QWEN_API_KEY"
     model: str = "Qwen/Qwen3-235B-A22B-Instruct-2507"
     request_timeout_s: float = 120.0
+    unset_proxy_env: bool = True
     max_concurrency: int = 32
     retry: RetryConfig = field(default_factory=RetryConfig)
     generation: TeacherGenerationConfig = field(default_factory=TeacherGenerationConfig)

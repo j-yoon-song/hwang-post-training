@@ -8,6 +8,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable
 
+import httpx
 from openai import OpenAI
 
 from .caches import SQLiteKVCache
@@ -38,7 +39,19 @@ class TeacherClient:
         self.stats = stats
         self.logger = logger or logging.getLogger(__name__)
         api_key = os.getenv(cfg.api_key_env, "token-placeholder")
-        self.client = OpenAI(base_url=cfg.base_url, api_key=api_key, timeout=cfg.request_timeout_s)
+        self._http_client: httpx.Client | None = None
+        if cfg.unset_proxy_env:
+            # Ensure API calls bypass HTTP(S)_PROXY env vars.
+            self._http_client = httpx.Client(timeout=cfg.request_timeout_s, trust_env=False)
+            self.client = OpenAI(
+                base_url=cfg.base_url,
+                api_key=api_key,
+                timeout=cfg.request_timeout_s,
+                http_client=self._http_client,
+            )
+            self.logger.info("Teacher client created with trust_env=False (proxy env disabled).")
+        else:
+            self.client = OpenAI(base_url=cfg.base_url, api_key=api_key, timeout=cfg.request_timeout_s)
         self.cache = SQLiteKVCache(cache_db_path, table_name="teacher_cache")
         self.random = random.Random()
 
@@ -169,3 +182,5 @@ class TeacherClient:
 
     def close(self) -> None:
         self.cache.close()
+        if self._http_client is not None:
+            self._http_client.close()
