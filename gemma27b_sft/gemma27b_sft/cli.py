@@ -13,7 +13,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     Adafactor,
-    DataCollatorForTokenClassification,
+    DataCollatorForSeq2Seq,
     Trainer,
     TrainingArguments,
 )
@@ -386,9 +386,10 @@ def run(cfg: SFTConfig) -> None:
         has_eval=eval_ds is not None,
         hf_gradient_checkpointing=use_hf_gradient_ckpt,
     )
-    collator = DataCollatorForTokenClassification(
+    collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer,
         padding=True,
+        model=model,
         pad_to_multiple_of=8,
         label_pad_token_id=-100,
         return_tensors="pt",
