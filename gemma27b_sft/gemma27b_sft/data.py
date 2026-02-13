@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from datasets import Dataset, load_dataset
+from datasets import Dataset
 from transformers import PreTrainedTokenizerBase
 
 from .config import DataConfig, SFTConfig
@@ -276,12 +276,6 @@ class CompletionDataCollator:
         return padded
 
 
-def _load_json_dataset(path: str) -> Dataset:
-    ds = load_dataset("json", data_files=path, split="train")
-    assert isinstance(ds, Dataset)
-    return ds
-
-
 def _safe_string(value: Any) -> str:
     if value is None:
         return ""
@@ -310,6 +304,9 @@ def _safe_load_json_dataset(path: str, cfg: DataConfig) -> Dataset:
     rows: list[dict[str, str]] = []
     bad_json = 0
     total_lines = 0
+    non_string_counts: dict[str, int] = {field: 0 for field in required_fields}
+    missing_counts: dict[str, int] = {field: 0 for field in required_fields}
+    sample_cast_logs = 0
     with Path(path).open("r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
             total_lines += 1
@@ -327,24 +324,38 @@ def _safe_load_json_dataset(path: str, cfg: DataConfig) -> Dataset:
                 continue
             out: dict[str, str] = {}
             for field in required_fields:
-                out[field] = _safe_string(record.get(field))
+                value = record.get(field)
+                if value is None:
+                    missing_counts[field] += 1
+                elif not isinstance(value, str):
+                    non_string_counts[field] += 1
+                    if sample_cast_logs < 8:
+                        logger.warning(
+                            "Casting non-string field=%s line=%s type=%s -> string",
+                            field,
+                            line_no,
+                            type(value).__name__,
+                        )
+                        sample_cast_logs += 1
+                out[field] = _safe_string(value)
             rows.append(out)
     if bad_json > 0:
         logger.warning("Ignored invalid JSON lines=%s while reading %s", bad_json, path)
-    logger.info("Safe JSON loader rows=%s total_lines=%s required_fields=%s", len(rows), total_lines, required_fields)
+    logger.info(
+        "Normalized JSON loader rows=%s total_lines=%s required_fields=%s non_string_counts=%s missing_counts=%s",
+        len(rows),
+        total_lines,
+        required_fields,
+        non_string_counts,
+        missing_counts,
+    )
     return Dataset.from_list(rows)
 
 
 def _load_json_dataset_resilient(path: str, cfg: DataConfig) -> Dataset:
-    try:
-        return _load_json_dataset(path)
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.warning(
-            "Primary JSON loader failed (%s: %s). Falling back to safe JSON loader.",
-            type(exc).__name__,
-            exc,
-        )
-        return _safe_load_json_dataset(path, cfg)
+    # Root-cause fix: avoid pyarrow JSON schema inference for mixed-type columns.
+    # We parse JSONL ourselves and normalize required fields to strings up front.
+    return _safe_load_json_dataset(path, cfg)
 
 
 def _map_with_retry(ds: Dataset, fn, num_proc: int, desc: str) -> Dataset:

@@ -241,6 +241,7 @@ def run(cfg: SFTConfig) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     _setup_logging()
+    logger.info("gemma27b_sft cli path=%s", Path(__file__).resolve())
     parser = _build_parser()
     args = parser.parse_args(argv)
 
