@@ -140,6 +140,13 @@ class MetricXScorer:
 
             worker_script = Path(__file__).with_name("metricx_worker.py").resolve()
             env = self._build_metricx_env()
+            if repo_dir:
+                existing_py_path = env.get("PYTHONPATH", "")
+                env["PYTHONPATH"] = (
+                    repo_dir
+                    if not existing_py_path
+                    else f"{repo_dir}{os.pathsep}{existing_py_path}"
+                )
             cmd = [
                 python_bin,
                 "-u",
@@ -194,6 +201,12 @@ class MetricXScorer:
                 return
 
             error = init_msg.get("error") or init_msg
+            if isinstance(error, str) and "No module named 'metricx24'" in error:
+                error = (
+                    "MetricX worker cannot import metricx24. "
+                    f"Check metricx.repo_dir={repo_dir} and that the repo exists; "
+                    "worker PYTHONPATH now includes metricx.repo_dir."
+                )
             self._stop_metricx_worker()
             raise RuntimeError(f"MetricX worker failed to initialize: {error}")
 
