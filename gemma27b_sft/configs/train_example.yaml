@@ -1,7 +1,7 @@
 model:
   name_or_path: google/gemma-2-27b-it
   trust_remote_code: false
-  attn_implementation: flash_attention_2
+  attn_implementation: auto
   freeze_output_embeddings: true
 
 data:

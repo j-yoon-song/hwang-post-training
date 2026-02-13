@@ -12,7 +12,7 @@ import yaml
 class ModelConfig:
     name_or_path: str = "google/gemma-2-27b-it"
     trust_remote_code: bool = False
-    attn_implementation: str | None = None
+    attn_implementation: str | None = "auto"
     freeze_output_embeddings: bool = True
 
 

@@ -59,8 +59,10 @@ python -m gemma27b_sft.cli --config configs/train_example.yaml
   - Keeps output embeddings frozen too (if not tied to input embeddings)
 - `train.gradient_checkpointing: true`
   - Recommended for Gemma 27B full SFT memory
-- `model.attn_implementation: flash_attention_2`
-  - Use if your environment supports it
+- `model.attn_implementation: auto` (recommended default)
+  - Uses `flash_attention_2` automatically when CUDA + `flash_attn` are available.
+  - Falls back to `sdpa` automatically if FlashAttention is unavailable.
+  - Install with `uv pip install flash-attn --no-build-isolation` when your CUDA toolchain supports it.
 
 ## 6) Output
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import logging
 import os
 from pathlib import Path
@@ -61,15 +62,44 @@ def _freeze_embeddings(model: AutoModelForCausalLM, freeze_output_embeddings: bo
     return trainable, frozen_params
 
 
+def _is_flash_attn_available() -> bool:
+    return torch.cuda.is_available() and importlib.util.find_spec("flash_attn") is not None
+
+
+def _resolve_attn_implementation(cfg: SFTConfig) -> str | None:
+    requested = (cfg.model.attn_implementation or "auto").strip().lower()
+    if requested in {"", "auto"}:
+        if _is_flash_attn_available():
+            logger.info("Attention implementation resolved to flash_attention_2 (auto mode).")
+            return "flash_attention_2"
+        logger.info("flash_attn unavailable; using sdpa attention implementation.")
+        return "sdpa"
+    return cfg.model.attn_implementation
+
+
 def _load_model(cfg: SFTConfig):
     model_kwargs: dict[str, object] = {
         "torch_dtype": torch.bfloat16 if cfg.train.bf16 else torch.float16,
         "trust_remote_code": cfg.model.trust_remote_code,
     }
-    if cfg.model.attn_implementation:
-        model_kwargs["attn_implementation"] = cfg.model.attn_implementation
-    model = AutoModelForCausalLM.from_pretrained(cfg.model.name_or_path, **model_kwargs)
-    return model
+    resolved_attn = _resolve_attn_implementation(cfg)
+    if resolved_attn:
+        model_kwargs["attn_implementation"] = resolved_attn
+    try:
+        model = AutoModelForCausalLM.from_pretrained(cfg.model.name_or_path, **model_kwargs)
+        return model
+    except Exception as exc:
+        # Allow training to continue on environments without flash-attn.
+        err = str(exc)
+        if resolved_attn == "flash_attention_2" and ("flash_attn" in err or "FlashAttention2" in err):
+            logger.warning(
+                "flash_attention_2 is unavailable at runtime (%s). Falling back to sdpa.",
+                err,
+            )
+            model_kwargs["attn_implementation"] = "sdpa"
+            model = AutoModelForCausalLM.from_pretrained(cfg.model.name_or_path, **model_kwargs)
+            return model
+        raise
 
 
 def _build_training_arguments(cfg: SFTConfig, grad_accum: int, has_eval: bool) -> TrainingArguments:
