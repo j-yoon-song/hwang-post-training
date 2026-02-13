@@ -72,12 +72,17 @@ class TrainConfig:
     report_to: list[str] = field(default_factory=list)
     resume_from_checkpoint: str | None = None
     ddp_find_unused_parameters: bool = False
+    expected_world_size: int | None = None
     fsdp: str | None = None
     fsdp_transformer_layer_cls_to_wrap: str = "auto"
     fsdp_backward_prefetch: str = "BACKWARD_PRE"
     fsdp_forward_prefetch: bool = False
     fsdp_cpu_offload: bool = False
     fsdp_use_orig_params: bool = True
+    fsdp_limit_all_gathers: bool = True
+    fsdp_activation_checkpointing: bool = True
+    fsdp_sync_module_states: bool = True
+    fsdp_cpu_ram_efficient_loading: bool = True
 
 
 @dataclass
@@ -166,6 +171,8 @@ def load_config(path: str | Path) -> SFTConfig:
         raise ValueError("This project enforces global_batch_size=64.")
     if cfg.train.max_seq_length <= 0:
         raise ValueError("train.max_seq_length must be > 0")
+    if cfg.train.expected_world_size is not None and cfg.train.expected_world_size <= 0:
+        raise ValueError("train.expected_world_size must be > 0 when set.")
     if cfg.data.preprocessing_num_workers < 0:
         raise ValueError("data.preprocessing_num_workers must be >= 0")
     if cfg.data.max_train_samples is not None and cfg.data.max_train_samples <= 0:

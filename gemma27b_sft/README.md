@@ -72,14 +72,21 @@ python -m gemma27b_sft.cli --config configs/train_example.yaml
   - Keeps output embeddings frozen too (if not tied to input embeddings)
 - `train.gradient_checkpointing: true`
   - Recommended for Gemma 3 27B full SFT memory
+- `train.max_seq_length: 1024` (default in provided configs)
+  - 27B full SFT at 2048 can easily OOM even on 8x H100 depending on stack version.
+  - Increase to 1536/2048 only after 1024 is stable.
 - `model.attn_implementation: auto` (recommended default)
   - Uses `flash_attention_2` automatically when CUDA + `flash_attn` are available.
   - Falls back to `sdpa` automatically if FlashAttention is unavailable.
   - Install with `uv pip install flash-attn --no-build-isolation` when your CUDA toolchain supports it.
 - `train.fsdp`
   - Set to `full_shard auto_wrap` for 27B full fine-tuning on 8x H100.
+- `train.expected_world_size`
+  - Use `8` for 8x H100. The CLI warns on mismatch and raises if FSDP is enabled with `WORLD_SIZE=1`.
 - `train.fsdp_transformer_layer_cls_to_wrap`
   - Set `auto` (recommended): class name is auto-detected from the loaded model.
+- `train.fsdp_limit_all_gathers`, `train.fsdp_activation_checkpointing`
+  - Enabled in `train_8xh100_fsdp.yaml` to reduce peak memory.
 - `data.source_lang_code`, `data.target_lang_code`
   - Set fixed language codes (example: `en`, `ko`).
   - WMT-style codes are supported directly; unknown codes are still accepted.
@@ -97,3 +104,13 @@ Also writes:
 - `resolved_config.yaml`
 - Hugging Face checkpoints (`checkpoint-*`)
 - Final model + tokenizer on `trainer.save_model()`
+
+## 7) If You Still See CUDA OOM
+
+Check these first:
+- Ensure multi-process launch is actually used:
+  - `accelerate launch --num_processes 8 ...`
+- Verify runtime:
+  - `WORLD_SIZE=8`
+  - `train.max_seq_length=1024`
+- Keep `per_device_train_batch_size=1` for 27B full SFT.

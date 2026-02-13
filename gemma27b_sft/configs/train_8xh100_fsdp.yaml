@@ -43,11 +43,11 @@ train:
   warmup_ratio: 0.03
   lr_scheduler_type: cosine
   weight_decay: 0.0
-  max_seq_length: 2048
+  max_seq_length: 1024
   bf16: true
   tf32: true
   gradient_checkpointing: true
-  dataloader_num_workers: 8
+  dataloader_num_workers: 4
   logging_steps: 10
   save_steps: 500
   eval_steps: 500
@@ -55,9 +55,14 @@ train:
   report_to: []
   resume_from_checkpoint:
   ddp_find_unused_parameters: false
+  expected_world_size: 8
   fsdp: full_shard auto_wrap
   fsdp_transformer_layer_cls_to_wrap: auto
   fsdp_backward_prefetch: BACKWARD_PRE
   fsdp_forward_prefetch: false
   fsdp_cpu_offload: false
   fsdp_use_orig_params: true
+  fsdp_limit_all_gathers: true
+  fsdp_activation_checkpointing: true
+  fsdp_sync_module_states: true
+  fsdp_cpu_ram_efficient_loading: true

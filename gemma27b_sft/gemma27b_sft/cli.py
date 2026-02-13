@@ -140,6 +140,10 @@ def _build_training_arguments(cfg: SFTConfig, grad_accum: int, has_eval: bool) -
             "forward_prefetch": cfg.train.fsdp_forward_prefetch,
             "cpu_offload": cfg.train.fsdp_cpu_offload,
             "use_orig_params": cfg.train.fsdp_use_orig_params,
+            "limit_all_gathers": cfg.train.fsdp_limit_all_gathers,
+            "activation_checkpointing": cfg.train.fsdp_activation_checkpointing,
+            "sync_module_states": cfg.train.fsdp_sync_module_states,
+            "cpu_ram_efficient_loading": cfg.train.fsdp_cpu_ram_efficient_loading,
         }
         layer_cls = cfg.train.fsdp_transformer_layer_cls_to_wrap
         if layer_cls and layer_cls.strip().lower() not in {"", "auto"}:
@@ -251,10 +255,33 @@ def _build_trainer(
     return FixedAdafactorTrainer(**supported_kwargs)
 
 
+def _validate_launch(cfg: SFTConfig) -> None:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    cuda_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if cfg.train.expected_world_size is not None and world_size != cfg.train.expected_world_size:
+        logger.warning(
+            "WORLD_SIZE mismatch expected=%s actual=%s. This can cause severe throughput/memory issues.",
+            cfg.train.expected_world_size,
+            world_size,
+        )
+    if cfg.train.fsdp and world_size <= 1 and cuda_count > 1:
+        raise RuntimeError(
+            "FSDP is enabled but WORLD_SIZE=1. Launch multi-process training.\n"
+            "Example: accelerate launch --num_processes 8 -m gemma27b_sft.cli --config <config.yaml>"
+        )
+    if "27b" in cfg.model.name_or_path.lower() and cfg.train.max_seq_length > 1024:
+        logger.warning(
+            "max_seq_length=%s is memory-heavy for 27B full SFT. "
+            "Use 1024 (or 768) first to avoid CUDA OOM.",
+            cfg.train.max_seq_length,
+        )
+
+
 def run(cfg: SFTConfig) -> None:
     output_dir = Path(cfg.train.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     dump_config(cfg, output_dir / "resolved_config.yaml")
+    _validate_launch(cfg)
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.name_or_path, use_fast=True)
     if tokenizer.pad_token is None:
