@@ -132,6 +132,15 @@ def _build_training_arguments(cfg: SFTConfig, grad_accum: int, has_eval: bool) -
         "remove_unused_columns": False,
         "ddp_find_unused_parameters": cfg.train.ddp_find_unused_parameters,
     }
+    if cfg.train.fsdp:
+        kwargs["fsdp"] = cfg.train.fsdp
+        kwargs["fsdp_config"] = {
+            "transformer_layer_cls_to_wrap": [cfg.train.fsdp_transformer_layer_cls_to_wrap],
+            "backward_prefetch": cfg.train.fsdp_backward_prefetch,
+            "forward_prefetch": cfg.train.fsdp_forward_prefetch,
+            "cpu_offload": cfg.train.fsdp_cpu_offload,
+            "use_orig_params": cfg.train.fsdp_use_orig_params,
+        }
     eval_mode = "steps" if has_eval else "no"
     if "evaluation_strategy" in ta_params:
         kwargs["evaluation_strategy"] = eval_mode
@@ -153,6 +162,8 @@ def _build_training_arguments(cfg: SFTConfig, grad_accum: int, has_eval: bool) -
     dropped_kwargs = sorted(set(kwargs) - set(supported_kwargs))
     if dropped_kwargs:
         logger.info("Skipping unsupported TrainingArguments kwargs: %s", ", ".join(dropped_kwargs))
+    if "fsdp" in supported_kwargs:
+        logger.info("FSDP enabled mode=%s config=%s", supported_kwargs["fsdp"], supported_kwargs.get("fsdp_config"))
 
     return TrainingArguments(**supported_kwargs)
 

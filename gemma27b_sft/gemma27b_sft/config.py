@@ -72,6 +72,12 @@ class TrainConfig:
     report_to: list[str] = field(default_factory=list)
     resume_from_checkpoint: str | None = None
     ddp_find_unused_parameters: bool = False
+    fsdp: str | None = None
+    fsdp_transformer_layer_cls_to_wrap: str = "Gemma2DecoderLayer"
+    fsdp_backward_prefetch: str = "BACKWARD_PRE"
+    fsdp_forward_prefetch: bool = False
+    fsdp_cpu_offload: bool = False
+    fsdp_use_orig_params: bool = True
 
 
 @dataclass
@@ -147,6 +153,8 @@ def load_config(path: str | Path) -> SFTConfig:
     cfg.data.train_file = _resolve_optional_path(cfg.data.train_file, base_dir) or cfg.data.train_file
     cfg.data.eval_file = _resolve_optional_path(cfg.data.eval_file, base_dir)
     cfg.train.output_dir = _resolve_optional_path(cfg.train.output_dir, base_dir) or cfg.train.output_dir
+    if cfg.train.fsdp is not None and not str(cfg.train.fsdp).strip():
+        cfg.train.fsdp = None
 
     if not Path(cfg.data.train_file).exists():
         raise FileNotFoundError(f"data.train_file not found: {cfg.data.train_file}")

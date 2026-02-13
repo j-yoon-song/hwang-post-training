@@ -54,6 +54,12 @@ Single-node multi-GPU (recommended via `accelerate`):
 accelerate launch --num_processes 8 -m gemma27b_sft.cli --config configs/train_example.yaml
 ```
 
+27B full SFT on 1 node / 8x H100 (FSDP full shard):
+
+```bash
+accelerate launch --num_processes 8 -m gemma27b_sft.cli --config configs/train_8xh100_fsdp.yaml
+```
+
 Single process debug run:
 
 ```bash
@@ -70,6 +76,10 @@ python -m gemma27b_sft.cli --config configs/train_example.yaml
   - Uses `flash_attention_2` automatically when CUDA + `flash_attn` are available.
   - Falls back to `sdpa` automatically if FlashAttention is unavailable.
   - Install with `uv pip install flash-attn --no-build-isolation` when your CUDA toolchain supports it.
+- `train.fsdp`
+  - Set to `full_shard auto_wrap` for 27B full fine-tuning on 8x H100.
+- `train.fsdp_transformer_layer_cls_to_wrap`
+  - Gemma 2 uses `Gemma2DecoderLayer`.
 - `data.source_lang_code`, `data.target_lang_code`
   - Set fixed language codes (example: `en`, `ko`).
   - WMT-style codes are supported directly; unknown codes are still accepted.
