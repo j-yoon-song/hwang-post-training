@@ -1,7 +1,7 @@
 model:
   name_or_path: google/gemma-3-27b-it
   trust_remote_code: false
-  attn_implementation: auto
+  attn_implementation: sdpa
   freeze_output_embeddings: true
 
 data:

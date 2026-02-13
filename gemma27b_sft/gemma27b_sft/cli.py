@@ -70,13 +70,29 @@ def _is_flash_attn_available() -> bool:
 
 def _resolve_attn_implementation(cfg: SFTConfig) -> str | None:
     requested = (cfg.model.attn_implementation or "auto").strip().lower()
+    resolved: str | None
     if requested in {"", "auto"}:
         if _is_flash_attn_available():
             logger.info("Attention implementation resolved to flash_attention_2 (auto mode).")
-            return "flash_attention_2"
-        logger.info("flash_attn unavailable; using sdpa attention implementation.")
+            resolved = "flash_attention_2"
+        else:
+            logger.info("flash_attn unavailable; using sdpa attention implementation.")
+            resolved = "sdpa"
+    else:
+        resolved = cfg.model.attn_implementation
+
+    if (
+        resolved == "flash_attention_2"
+        and cfg.train.fsdp
+        and cfg.train.fsdp_activation_checkpointing
+    ):
+        logger.warning(
+            "Switching attention implementation to sdpa because "
+            "flash_attention_2 + FSDP activation checkpointing can trigger "
+            "torch.utils.checkpoint.CheckpointError (metadata mismatch) on current stacks."
+        )
         return "sdpa"
-    return cfg.model.attn_implementation
+    return resolved
 
 
 def _load_model(cfg: SFTConfig):

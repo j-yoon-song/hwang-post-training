@@ -79,6 +79,8 @@ python -m gemma27b_sft.cli --config configs/train_example.yaml
   - Uses `flash_attention_2` automatically when CUDA + `flash_attn` are available.
   - Falls back to `sdpa` automatically if FlashAttention is unavailable.
   - Install with `uv pip install flash-attn --no-build-isolation` when your CUDA toolchain supports it.
+  - For FSDP + activation checkpointing, this project forces `sdpa` to avoid known
+    checkpoint metadata mismatch errors (for example tensor size `1024` vs `2047`).
 - `train.fsdp`
   - Set to `full_shard auto_wrap` for 27B full fine-tuning on 8x H100.
 - `train.expected_world_size`
