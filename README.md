@@ -135,6 +135,10 @@ source .venv/bin/activate
 - MADLAD dataset script 로딩 허용 여부 (기본 `true`)
 - `data.local_data_glob`
 - 로컬에 미리 받은 jsonl.gz 파일을 직접 읽을 glob 패턴. 설정하면 Hub의 MADLAD script 로딩을 우회함.
+- `data.stop_when_pool_ready`
+- `true`면 샘플 풀을 채울 수 있는 상태가 되자마자 `sample_sources` 스캔을 조기 종료
+- `data.max_scan_docs`
+- `sample_sources` 단계 최대 문서 스캔 수 상한. 기본 5,000,000
 - `metricx.backend`
 - `metricx24_cli` 사용
 - `metricx.device`
@@ -319,9 +323,16 @@ python -m synth_parallel.cli run --config config/example.yaml --stage export
 - MetricX 전용 env에서 `cd third_party/metricx && python -m metricx24.predict --help` 먼저 확인
 - Qwen API 인증 실패
 - `QWEN_API_KEY` 값과 `teacher.api_key_env` 일치 확인
+- Qwen API timeout
+- `teacher.request_timeout_s`를 300~600으로 증가
+- `teacher.max_concurrency`를 2~4로 하향
+- `teacher.generation.max_tokens`를 256~384로 하향
 - 처리 도중 중단됨
 - `--resume`로 재개
 - 완전 재실행이 필요하면 `--overwrite` 사용
+- `sample_sources`에서 docs/segments가 너무 크게 증가
+- `data.stop_when_pool_ready: true` 확인
+- `data.max_scan_docs`를 더 낮춰서 상한 강제(예: 1,000,000)
 - MetricX가 CPU로 동작함
 - `metricx.device` 값(`cuda:0`) 확인
 - 드라이버/CUDA/torch 호환성 점검

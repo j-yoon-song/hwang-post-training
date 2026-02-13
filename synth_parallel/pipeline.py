@@ -149,9 +149,10 @@ class PipelineRunner:
             logger.info("sample_sources output already exists, skip due to --resume: %s", out_path)
             return
 
-        # In full runs, do not cap document scan by default.
+        # In full runs, cap scan by data.max_scan_docs to avoid scanning the whole corpus.
         # In dry-run, _effective_limit() returns a small default (1000).
         limit = self._effective_limit()
+        scan_doc_cap = limit if limit is not None else self.cfg.data.max_scan_docs
         pool_size = min(self.cfg.data.sample_pool_size, limit) if limit else self.cfg.data.sample_pool_size
 
         sentence_quota = int(pool_size * self.cfg.data.sentence_ratio)
@@ -264,13 +265,39 @@ class PipelineRunner:
                     blob_sampler.add(row, row["length_approx"])
 
             if processed_docs % 500 == 0:
+                sentence_buffered = sentence_sampler.buffered_count()
+                blob_buffered = blob_sampler.buffered_count() if blob_sampler is not None else 0
                 logger.info(
-                    "sample_sources progress docs=%s segments=%s",
+                    "sample_sources progress docs=%s segments=%s sentence_buffered=%s/%s blob_buffered=%s/%s",
                     processed_docs,
                     processed_segments,
+                    sentence_buffered,
+                    sentence_quota,
+                    blob_buffered,
+                    blob_quota,
                 )
 
-            if limit is not None and processed_docs >= limit:
+            if (
+                self.cfg.data.stop_when_pool_ready
+                and sentence_sampler.can_fill_target()
+                and (blob_sampler is None or blob_sampler.can_fill_target())
+            ):
+                logger.info(
+                    "sample_sources early stop: pool ready docs=%s segments=%s sentence_buffered=%s/%s blob_buffered=%s/%s",
+                    processed_docs,
+                    processed_segments,
+                    sentence_sampler.buffered_count(),
+                    sentence_quota,
+                    (blob_sampler.buffered_count() if blob_sampler is not None else 0),
+                    blob_quota,
+                )
+                break
+
+            if scan_doc_cap is not None and processed_docs >= scan_doc_cap:
+                logger.warning(
+                    "sample_sources stopped by max scan cap docs=%s (data.max_scan_docs or --limit).",
+                    scan_doc_cap,
+                )
                 break
 
         sampled_sentences, sentence_stats = sentence_sampler.finalize()
@@ -283,6 +310,13 @@ class PipelineRunner:
         self._rng.shuffle(sampled)
         if len(sampled) > pool_size:
             sampled = self._rng.sample(sampled, k=pool_size)
+        if len(sampled) < pool_size:
+            logger.warning(
+                "sample_sources produced fewer rows than requested sampled=%s requested=%s. "
+                "Increase data.max_scan_docs or relax segmentation/bucketing constraints.",
+                len(sampled),
+                pool_size,
+            )
 
         logger.info(
             "sample_sources done docs=%s segments=%s sampled=%s (sentence=%s blob=%s)",

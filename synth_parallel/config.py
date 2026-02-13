@@ -30,6 +30,8 @@ class DataConfig:
     sample_pool_size: int = 1_000_000
     text_field: str = "text"
     streaming: bool = True
+    stop_when_pool_ready: bool = True
+    max_scan_docs: int | None = 5_000_000
     sentence_ratio: float = 0.5
     blob_ratio: float = 0.5
 
@@ -232,6 +234,8 @@ def load_config(path: str | Path) -> PipelineConfig:
         raise ValueError("data.sample_pool_size must be > 0")
     if cfg.data.target_examples_total <= 0:
         raise ValueError("data.target_examples_total must be > 0")
+    if cfg.data.max_scan_docs is not None and cfg.data.max_scan_docs <= 0:
+        raise ValueError("data.max_scan_docs must be > 0 when set")
     if cfg.teacher.max_concurrency <= 0:
         raise ValueError("teacher.max_concurrency must be > 0")
     if cfg.teacher.sdk_max_retries < 0:

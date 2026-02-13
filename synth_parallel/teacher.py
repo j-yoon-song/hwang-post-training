@@ -189,6 +189,11 @@ class TeacherClient:
                 wait = wait + self.random.random() * 0.25
 
                 no_retry = False
+                timeout_like = isinstance(exc, httpx.TimeoutException)
+                if not timeout_like:
+                    msg_lower = str(exc).lower()
+                    timeout_like = "timeout" in type(exc).__name__.lower() or "timed out" in msg_lower
+
                 if isinstance(exc, APIStatusError):
                     status = int(getattr(exc, "status_code", 0) or 0)
                     resp_text = getattr(getattr(exc, "response", None), "text", None)
@@ -206,6 +211,15 @@ class TeacherClient:
                         "Teacher error type=%s detail=%r",
                         type(exc).__name__,
                         exc,
+                    )
+                if timeout_like:
+                    self.logger.error(
+                        "Timeout hint: increase teacher.request_timeout_s or lower "
+                        "teacher.max_concurrency / teacher.generation.max_tokens "
+                        "(current timeout=%s, concurrency=%s, max_tokens=%s).",
+                        self.cfg.request_timeout_s,
+                        self.cfg.max_concurrency,
+                        max_tokens,
                     )
 
                 self.logger.warning(

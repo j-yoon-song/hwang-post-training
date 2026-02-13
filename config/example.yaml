@@ -18,6 +18,8 @@ data:
   sample_pool_size: 1000000
   text_field: text
   streaming: true
+  stop_when_pool_ready: true
+  max_scan_docs: 5000000
   sentence_ratio: 0.5
   blob_ratio: 0.5
 
@@ -41,15 +43,15 @@ teacher:
   base_url: https://your-qwen-endpoint.example.com/v1
   api_key_env: QWEN_API_KEY
   model: Qwen/Qwen3-235B-A22B-Instruct-2507
-  request_timeout_s: 120
+  request_timeout_s: 300
   sdk_max_retries: 0
   unset_proxy_env: true
-  max_concurrency: 8
+  max_concurrency: 4
   retry:
     max_attempts: 6
     backoff_s: [1, 2, 4, 8, 16, 32]
   generation:
-    max_tokens: 512
+    max_tokens: 384
     top_p: 1.0
     greedy_temperature: 0.0
     sample_temperature: 1.0

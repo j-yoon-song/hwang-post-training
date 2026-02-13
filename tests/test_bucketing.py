@@ -29,3 +29,27 @@ def test_balanced_sampler_quota_and_fill():
 
     assert len(selected) == 6
     assert sum(s.kept for s in stats.values()) <= 6
+
+
+def test_balanced_sampler_can_fill_target_true_with_extras():
+    boundaries = [0, 10, 20]
+    sampler = BalancedBucketSampler(boundaries, sample_size=4, oversample_factor=2.0, seed=7)
+
+    for i in range(20):
+        sampler.add({"id": f"a{i}", "length_approx": 5}, 5)
+
+    assert sampler.buffered_count() == 4
+    assert sampler.can_fill_target() is True
+
+
+def test_balanced_sampler_can_fill_target_false_when_skewed_and_small_capacity():
+    boundaries = [0, 10, 20, 30]
+    sampler = BalancedBucketSampler(boundaries, sample_size=6, oversample_factor=2.0, seed=7)
+
+    for i in range(100):
+        sampler.add({"id": f"a{i}", "length_approx": 5}, 5)
+
+    # Bucket0 quota=2, capacity=4, so with only one bucket populated
+    # the sampler cannot fill all 6 targets.
+    assert sampler.buffered_count() == 4
+    assert sampler.can_fill_target() is False

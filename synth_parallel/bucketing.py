@@ -63,6 +63,22 @@ class BalancedBucketSampler:
         if j < capacity:
             reservoir[j] = item
 
+    def buffered_count(self) -> int:
+        return sum(len(pool) for pool in self.reservoirs)
+
+    def can_fill_target(self) -> bool:
+        if self.sample_size <= 0:
+            return True
+        selected = 0
+        extras = 0
+        for bucket_id in range(self.num_buckets):
+            pool_len = len(self.reservoirs[bucket_id])
+            quota = self.quotas[bucket_id]
+            selected += min(quota, pool_len)
+            extras += max(0, pool_len - quota)
+        deficit = max(0, self.sample_size - selected)
+        return extras >= deficit
+
     def finalize(self) -> tuple[list[dict[str, Any]], dict[int, BucketStats]]:
         selected: list[dict[str, Any]] = []
         extras: list[dict[str, Any]] = []
