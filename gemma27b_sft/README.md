@@ -66,7 +66,22 @@ Single process debug run:
 python -m gemma27b_sft.cli --config configs/train_example.yaml
 ```
 
-## 5) Config Notes
+## 5) Quick Inference
+
+From `gemma27b_sft` directory:
+
+```bash
+bash scripts/sample_infer.sh
+```
+
+Optional overrides:
+
+```bash
+MODEL_DIR=../outputs/gemma3-27b-it-sft-fsdp/checkpoint-1000 bash scripts/sample_infer.sh
+SRC_TEXT="I love this project." bash scripts/sample_infer.sh
+```
+
+## 6) Config Notes
 
 - `model.freeze_output_embeddings: true`
   - Keeps output embeddings frozen too (if not tied to input embeddings)
@@ -99,7 +114,7 @@ python -m gemma27b_sft.cli --config configs/train_example.yaml
 - `data.source_lang_name`, `data.target_lang_name`
   - Use `auto` to infer language names from WMT-style codes.
 
-## 6) Output
+## 7) Output
 
 The trainer writes to:
 - `train.output_dir`
@@ -109,7 +124,7 @@ Also writes:
 - Hugging Face checkpoints (`checkpoint-*`)
 - Final model + tokenizer on `trainer.save_model()`
 
-## 7) If You Still See CUDA OOM
+## 8) If You Still See CUDA OOM
 
 Check these first:
 - Ensure multi-process launch is actually used:
