@@ -71,6 +71,47 @@ _WMT_LANGUAGE_NAMES: dict[str, str] = {
 }
 
 
+def _coerce_token_ids(value: Any, field_name: str) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().tolist()
+    if isinstance(value, tuple):
+        value = list(value)
+    if isinstance(value, int):
+        return [int(value)]
+    if isinstance(value, list):
+        if not value:
+            return []
+        if isinstance(value[0], list):
+            flat: list[int] = []
+            for item in value:
+                flat.extend(_coerce_token_ids(item, field_name))
+            return flat
+        try:
+            return [int(v) for v in value]
+        except Exception as exc:  # pylint: disable=broad-except
+            raise ValueError(f"Invalid {field_name} list values: {value[:8]}") from exc
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        try:
+            decoded = json.loads(raw)
+            if isinstance(decoded, list):
+                return [int(v) for v in decoded]
+            if isinstance(decoded, int):
+                return [int(decoded)]
+        except Exception:  # pylint: disable=broad-except
+            pass
+        # Fallback: allow whitespace-separated token id strings.
+        parts = raw.split()
+        if parts and all(part.lstrip("-").isdigit() for part in parts):
+            return [int(part) for part in parts]
+        raise ValueError(f"{field_name} is a non-token string: {raw[:120]!r}")
+    raise ValueError(f"type of {field_name} is unknown: {type(value)}")
+
+
 def _normalize_code(code: str) -> str:
     return code.strip().replace("_", "-").lower()
 
@@ -160,7 +201,13 @@ def _apply_chat_template(
         if truncate:
             kwargs["max_length"] = max_seq_length
         ids = tokenizer.apply_chat_template(messages, **kwargs)
-        return list(ids)
+        # Some tokenizer/template combinations can return non-list types.
+        if isinstance(ids, str):
+            tok_kwargs: dict[str, Any] = {"add_special_tokens": False, "truncation": truncate}
+            if truncate:
+                tok_kwargs["max_length"] = max_seq_length
+            ids = tokenizer(ids, **tok_kwargs)["input_ids"]
+        return _coerce_token_ids(ids, "input_ids")
 
     parts = []
     for msg in messages:
@@ -175,7 +222,7 @@ def _apply_chat_template(
     }
     if truncate:
         tok_kwargs["max_length"] = max_seq_length
-    return list(tokenizer(text, **tok_kwargs)["input_ids"])
+    return _coerce_token_ids(tokenizer(text, **tok_kwargs)["input_ids"], "input_ids")
 
 
 def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
@@ -199,6 +246,7 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
                 add_special_tokens=False,
             )["input_ids"]
         )
+        target_ids_raw = _coerce_token_ids(target_ids_raw, "target_ids")
         has_target = len(target_ids_raw) > 0 and bool(target_text.strip())
 
         # Build training sample as: [prompt-with-generation-prefix] + [target tokens].
@@ -258,9 +306,28 @@ class CompletionDataCollator:
     pad_to_multiple_of: int | None = 8
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        normalized_features = []
+        for idx, feature in enumerate(features):
+            try:
+                input_ids = _coerce_token_ids(feature.get("input_ids"), "input_ids")
+                attention_mask = _coerce_token_ids(feature.get("attention_mask"), "attention_mask")
+                labels = _coerce_token_ids(feature.get("labels"), "labels")
+            except Exception as exc:  # pylint: disable=broad-except
+                raise ValueError(
+                    f"Feature normalization failed at batch_index={idx}: {exc}. "
+                    f"feature_keys={list(feature.keys())}"
+                ) from exc
+            normalized_features.append(
+                {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "labels": labels,
+                }
+            )
+
         batch_inputs = [
             {"input_ids": f["input_ids"], "attention_mask": f["attention_mask"]}
-            for f in features
+            for f in normalized_features
         ]
         padded = self.tokenizer.pad(
             batch_inputs,
@@ -269,7 +336,7 @@ class CompletionDataCollator:
         )
         seq_len = int(padded["input_ids"].shape[1])
         labels = []
-        for feature in features:
+        for feature in normalized_features:
             raw = feature["labels"]
             labels.append(raw + [-100] * (seq_len - len(raw)))
         padded["labels"] = torch.tensor(labels, dtype=torch.long)
