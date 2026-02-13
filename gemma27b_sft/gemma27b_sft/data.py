@@ -147,15 +147,17 @@ def _apply_chat_template(
     messages: list[dict[str, str]],
     add_generation_prompt: bool,
     max_seq_length: int,
+    truncate: bool = True,
 ) -> list[int]:
     if getattr(tokenizer, "chat_template", None):
-        ids = tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=add_generation_prompt,
-            truncation=True,
-            max_length=max_seq_length,
-        )
+        kwargs: dict[str, Any] = {
+            "tokenize": True,
+            "add_generation_prompt": add_generation_prompt,
+            "truncation": truncate,
+        }
+        if truncate:
+            kwargs["max_length"] = max_seq_length
+        ids = tokenizer.apply_chat_template(messages, **kwargs)
         return list(ids)
 
     parts = []
@@ -165,14 +167,13 @@ def _apply_chat_template(
     if add_generation_prompt:
         parts.append("ASSISTANT:")
     text = "\n\n".join(parts)
-    return list(
-        tokenizer(
-            text,
-            truncation=True,
-            max_length=max_seq_length,
-            add_special_tokens=True,
-        )["input_ids"]
-    )
+    tok_kwargs: dict[str, Any] = {
+        "truncation": truncate,
+        "add_special_tokens": True,
+    }
+    if truncate:
+        tok_kwargs["max_length"] = max_seq_length
+    return list(tokenizer(text, **tok_kwargs)["input_ids"])
 
 
 def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
@@ -189,26 +190,46 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
         labels: list[int] = []
         non_ignored = 0
 
-        # If prompt/source is too long and truncates away assistant tokens,
-        # shrink only source text and retry a few times.
+        target_ids_raw = list(
+            tokenizer(
+                target_text,
+                truncation=False,
+                add_special_tokens=False,
+            )["input_ids"]
+        )
+        has_target = len(target_ids_raw) > 0 and bool(target_text.strip())
+
+        # Build training sample as: [prompt-with-generation-prefix] + [target tokens].
+        # This avoids template-diff corner cases that can produce zero target labels.
         while True:
-            prompt_messages, full_messages = _messages(data_cfg, example, source_text, target_text)
-            prompt_ids = _apply_chat_template(
+            prompt_messages, _ = _messages(data_cfg, example, source_text, target_text)
+            prompt_ids_raw = _apply_chat_template(
                 tokenizer=tokenizer,
                 messages=prompt_messages,
                 add_generation_prompt=True,
                 max_seq_length=max_len,
+                truncate=False,
             )
-            full_ids = _apply_chat_template(
-                tokenizer=tokenizer,
-                messages=full_messages,
-                add_generation_prompt=False,
-                max_seq_length=max_len,
-            )
-            prompt_len = min(len(prompt_ids), len(full_ids))
-            labels = [-100] * prompt_len + full_ids[prompt_len:]
-            non_ignored = sum(1 for x in labels if x != -100)
-            if non_ignored > 0 or len(source_text) <= 1 or source_shrink_steps >= 6:
+
+            if not has_target:
+                prompt_ids = prompt_ids_raw[:max_len]
+                target_ids = []
+            else:
+                if len(prompt_ids_raw) + len(target_ids_raw) <= max_len:
+                    prompt_ids = prompt_ids_raw
+                    target_ids = target_ids_raw
+                else:
+                    target_reserve = min(len(target_ids_raw), max(32, max_len // 8))
+                    prompt_budget = max(0, max_len - target_reserve)
+                    prompt_ids = prompt_ids_raw[:prompt_budget]
+                    target_budget = max(0, max_len - len(prompt_ids))
+                    target_ids = target_ids_raw[:target_budget]
+
+            full_ids = prompt_ids + target_ids
+            labels = ([-100] * len(prompt_ids)) + target_ids
+            non_ignored = len(target_ids)
+
+            if non_ignored > 0 or not has_target or len(source_text) <= 1 or source_shrink_steps >= 6:
                 break
             source_text = source_text[: max(1, len(source_text) // 2)]
             source_shrink_steps += 1
