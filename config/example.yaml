@@ -68,10 +68,13 @@ final_generation:
 
 metricx:
   checkpoint: google/metricx-24-hybrid-large-v2p6
-  batch_size: 64
+  batch_size: 1
   device: cuda:0
   cache_db: metricx_cache.sqlite
   backend: metricx24_cli
+  persistent_worker: true
+  worker_start_timeout_s: 600
+  worker_response_timeout_s: 1800
   python_bin: ../.venv-metricx/bin/python
   module: metricx24.predict
   repo_dir: ../third_party/metricx

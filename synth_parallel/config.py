@@ -105,10 +105,13 @@ class FinalGenerationConfig:
 @dataclass
 class MetricXConfig:
     checkpoint: str = "google/metricx-24-hybrid-large-v2p6"
-    batch_size: int = 64
+    batch_size: int = 1
     device: str = "cuda"
     cache_db: str = "./runs/exp001/metricx_cache.sqlite"
     backend: str = "metricx24_cli"
+    persistent_worker: bool = True
+    worker_start_timeout_s: int = 600
+    worker_response_timeout_s: int = 1800
     python_bin: str = ""
     module: str = "metricx24.predict"
     repo_dir: str = ""
@@ -221,6 +224,8 @@ def load_config(path: str | Path) -> PipelineConfig:
     cfg.metricx.python_bin = _resolve_optional_path(cfg.metricx.python_bin, config_dir) or ""
     cfg.metricx.repo_dir = _resolve_optional_path(cfg.metricx.repo_dir, config_dir) or ""
     cfg.data.local_data_glob = _resolve_optional_path(cfg.data.local_data_glob, config_dir)
+    # Force MetricX batch size to 1 for stable/compatible execution.
+    cfg.metricx.batch_size = 1
 
     dataset_name = cfg.data.madlad_dataset.strip()
     if "allendai/" in dataset_name.lower():
@@ -240,6 +245,10 @@ def load_config(path: str | Path) -> PipelineConfig:
         raise ValueError("teacher.max_concurrency must be > 0")
     if cfg.teacher.sdk_max_retries < 0:
         raise ValueError("teacher.sdk_max_retries must be >= 0")
+    if cfg.metricx.worker_start_timeout_s <= 0:
+        raise ValueError("metricx.worker_start_timeout_s must be > 0")
+    if cfg.metricx.worker_response_timeout_s <= 0:
+        raise ValueError("metricx.worker_response_timeout_s must be > 0")
     if cfg.final_generation.num_candidates <= 0:
         raise ValueError("final_generation.num_candidates must be > 0")
     if cfg.metricx.python_bin and not Path(cfg.metricx.python_bin).exists():

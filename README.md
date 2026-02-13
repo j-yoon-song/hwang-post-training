@@ -101,6 +101,9 @@ uv pip install "fsspec<2023.10.0"
 # datasets==2.13.1과 최신 pyarrow 충돌 방지
 uv pip install "pyarrow<21"
 
+# 구버전 의존성과 NumPy 2.x 충돌 방지
+uv pip install "numpy<2"
+
 # 설치 확인
 cd third_party/metricx
 python -m metricx24.predict --help
@@ -144,6 +147,10 @@ source .venv/bin/activate
 - `sample_sources` 단계 최대 문서 스캔 수 상한. 기본 5,000,000
 - `metricx.backend`
 - `metricx24_cli` 사용
+- `metricx.persistent_worker`
+- `true`면 MetricX 모델을 worker 프로세스로 1회 로드 후 재사용 (기본 `true`)
+- `metricx.worker_start_timeout_s`, `metricx.worker_response_timeout_s`
+- worker 시작/응답 타임아웃(초)
 - `metricx.device`
 - `cuda:0` 권장 (H100 1장 고정)
 - `metricx.python_bin`
@@ -156,6 +163,8 @@ source .venv/bin/activate
 - `google-research/metricx`를 clone한 디렉터리(예: `../third_party/metricx`)
 - `metricx.max_input_length`
 - MetricX-24 기본 1536 권장(레포 README 예시)
+- `metricx.batch_size`
+- 파이프라인 정책상 **항상 1로 강제**됨(설정값을 넣어도 실행 시 1 사용)
 
 예시(중요 부분):
 
@@ -171,6 +180,7 @@ teacher:
 metricx:
   backend: metricx24_cli
   checkpoint: google/metricx-24-hybrid-large-v2p6
+  persistent_worker: true
   device: cuda:0
   python_bin: ../.venv-metricx/bin/python
   module: metricx24.predict
@@ -317,6 +327,7 @@ python -m synth_parallel.cli run --config config/example.yaml --stage export
 - 대규모 실행 전 반드시 dry-run으로 API/MetricX 연결 확인
 - `sample_pool_size`, `target_examples_total`, `num_candidates`를 작게 줄여 비용/시간 예측
 - MetricX GPU 고정은 `metricx.device: cuda:0` 사용
+- MetricX는 기본적으로 persistent worker 모드로 실행되어, 파이프라인 중 모델을 반복 로드하지 않음
 - 샤딩 시 모든 워커가 같은 입력/설정 버전을 사용해야 재현성 유지
 
 ## 11. 트러블슈팅
@@ -327,6 +338,9 @@ python -m synth_parallel.cli run --config config/example.yaml --stage export
 - `NotImplementedError: Loading a dataset cached in a LocalFileSystem is not supported`
 - MetricX env에서 `fsspec` 버전 충돌 가능성이 큼
 - `uv pip install \"fsspec<2023.10.0\"` 후 재시도
+- `ValueError: Unable to avoid copy while creating an array as requested`
+- MetricX env의 NumPy 2.x 호환성 이슈 가능성이 큼
+- `uv pip install \"numpy<2\"` 후 재시도
 - Qwen API 인증 실패
 - `QWEN_API_KEY` 값과 `teacher.api_key_env` 일치 확인
 - Qwen API timeout

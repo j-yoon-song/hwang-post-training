@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import uuid
 from pathlib import Path
 
 from .caches import SQLiteKVCache
@@ -28,6 +31,17 @@ class MetricXScorer:
         self.cache = SQLiteKVCache(cache_db_path, table_name="metricx_cache")
         self.stats = stats
         self.logger = logger or logging.getLogger(__name__)
+        self._worker_proc: subprocess.Popen[str] | None = None
+        self._worker_stdout_q: queue.Queue[str] | None = None
+        self._worker_stdout_thread: threading.Thread | None = None
+        self._worker_stderr_thread: threading.Thread | None = None
+        self._worker_lock = threading.Lock()
+        if self.cfg.batch_size != 1:
+            self.logger.warning(
+                "metricx.batch_size=%s is overridden to 1 (fixed policy).",
+                self.cfg.batch_size,
+            )
+            self.cfg.batch_size = 1
 
     def _cache_key(self, source: str, hypothesis: str) -> str:
         return stable_hash({"source": source, "hypothesis": hypothesis, "checkpoint": self.cfg.checkpoint})
@@ -51,7 +65,10 @@ class MetricXScorer:
         if uncached_pairs:
             with self.stats.time_block("metricx.score_batch"):
                 if self.cfg.backend == "metricx24_cli":
-                    scores = self._score_metricx24_cli(uncached_pairs)
+                    if self.cfg.persistent_worker:
+                        scores = self._score_metricx24_persistent(uncached_pairs)
+                    else:
+                        scores = self._score_metricx24_cli(uncached_pairs)
                 else:
                     scores = [self._heuristic_score(src, hyp) for src, hyp in uncached_pairs]
                     self.logger.warning(
@@ -64,6 +81,198 @@ class MetricXScorer:
                 self.cache.set(key, {"score": score, "backend": self.cfg.backend})
 
         return [float(x) if x is not None else 25.0 for x in results]
+
+    @staticmethod
+    def _reader_thread(stream, out_q: queue.Queue[str] | None = None, logger: logging.Logger | None = None) -> None:
+        try:
+            for line in iter(stream.readline, ""):
+                if out_q is not None:
+                    out_q.put(line)
+                elif logger is not None:
+                    text = line.strip()
+                    if text:
+                        logger.info("MetricX worker stderr | %s", text)
+        finally:
+            try:
+                stream.close()
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+    def _read_worker_json(self, timeout_s: int) -> dict:
+        if self._worker_stdout_q is None:
+            raise RuntimeError("MetricX worker stdout queue is not initialized.")
+        deadline = time.time() + timeout_s
+        while True:
+            remaining = max(0.0, deadline - time.time())
+            if remaining == 0.0:
+                raise TimeoutError(f"Timed out waiting MetricX worker response ({timeout_s}s).")
+            try:
+                line = self._worker_stdout_q.get(timeout=remaining)
+            except queue.Empty as exc:
+                raise TimeoutError(f"Timed out waiting MetricX worker response ({timeout_s}s).") from exc
+
+            payload = line.strip()
+            if not payload:
+                continue
+            try:
+                parsed = json.loads(payload)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"MetricX worker emitted invalid JSON: {payload[:200]}") from exc
+            if not isinstance(parsed, dict):
+                raise RuntimeError(f"MetricX worker response must be object, got: {type(parsed)}")
+            return parsed
+
+    def _ensure_metricx_worker(self) -> None:
+        with self._worker_lock:
+            if self._worker_proc is not None and self._worker_proc.poll() is None:
+                return
+
+            python_bin = self.cfg.python_bin.strip() if self.cfg.python_bin else ""
+            if not python_bin:
+                python_bin = sys.executable
+
+            repo_dir = self.cfg.repo_dir.strip() if getattr(self.cfg, "repo_dir", "") else ""
+            cwd = repo_dir or None
+            if repo_dir and not Path(repo_dir).exists():
+                raise RuntimeError(f"metricx.repo_dir does not exist: {repo_dir}")
+
+            self._validate_metricx_runtime(python_bin, cwd)
+
+            worker_script = Path(__file__).with_name("metricx_worker.py").resolve()
+            env = self._build_metricx_env()
+            cmd = [
+                python_bin,
+                "-u",
+                str(worker_script),
+                "--tokenizer",
+                self.cfg.tokenizer,
+                "--model_name_or_path",
+                self.cfg.checkpoint,
+                "--max_input_length",
+                str(self.cfg.max_input_length),
+                "--device",
+                self.cfg.device,
+                "--qe",
+            ]
+
+            self.logger.info("Starting persistent MetricX worker: %s", " ".join(cmd))
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                env=env,
+                cwd=cwd,
+            )
+            if proc.stdin is None or proc.stdout is None or proc.stderr is None:
+                raise RuntimeError("Failed to create MetricX worker stdio pipes.")
+
+            stdout_q: queue.Queue[str] = queue.Queue()
+            stdout_thread = threading.Thread(
+                target=self._reader_thread,
+                args=(proc.stdout, stdout_q, None),
+                daemon=True,
+            )
+            stderr_thread = threading.Thread(
+                target=self._reader_thread,
+                args=(proc.stderr, None, self.logger),
+                daemon=True,
+            )
+            stdout_thread.start()
+            stderr_thread.start()
+
+            self._worker_proc = proc
+            self._worker_stdout_q = stdout_q
+            self._worker_stdout_thread = stdout_thread
+            self._worker_stderr_thread = stderr_thread
+
+            init_msg = self._read_worker_json(timeout_s=self.cfg.worker_start_timeout_s)
+            if init_msg.get("event") == "ready" and init_msg.get("ok", True):
+                self.logger.info("MetricX worker ready device=%s", init_msg.get("device"))
+                return
+
+            error = init_msg.get("error") or init_msg
+            self._stop_metricx_worker()
+            raise RuntimeError(f"MetricX worker failed to initialize: {error}")
+
+    def _score_metricx24_persistent(self, pairs: list[tuple[str, str]]) -> list[float]:
+        if not pairs:
+            return []
+
+        self._ensure_metricx_worker()
+        if self._worker_proc is None or self._worker_proc.stdin is None:
+            raise RuntimeError("MetricX worker is not available.")
+
+        req_id = uuid.uuid4().hex
+        payload = {
+            "id": req_id,
+            "pairs": [{"source": source, "hypothesis": hyp} for source, hyp in pairs],
+        }
+        started = time.perf_counter()
+        self.logger.info("MetricX worker request start pairs=%s", len(pairs))
+        try:
+            self._worker_proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            self._worker_proc.stdin.flush()
+        except Exception as exc:  # pylint: disable=broad-except
+            self._stop_metricx_worker()
+            raise RuntimeError(f"Failed to send request to MetricX worker: {exc}") from exc
+
+        # Worker emits one response per request in order.
+        response = self._read_worker_json(timeout_s=self.cfg.worker_response_timeout_s)
+        if response.get("id") != req_id:
+            self._stop_metricx_worker()
+            raise RuntimeError(
+                "MetricX worker response id mismatch. "
+                f"expected={req_id}, got={response.get('id')}"
+            )
+        if not response.get("ok", False):
+            error = response.get("error", "unknown worker error")
+            tb = response.get("traceback", "")
+            raise RuntimeError(f"MetricX worker failed: {error}\n{tb}")
+
+        scores = response.get("scores")
+        if not isinstance(scores, list):
+            raise RuntimeError(f"MetricX worker response missing scores list: {response}")
+        if len(scores) != len(pairs):
+            raise RuntimeError(
+                f"MetricX worker score size mismatch: expected={len(pairs)} got={len(scores)}"
+            )
+        self.logger.info(
+            "MetricX worker request done pairs=%s elapsed=%.2fs",
+            len(pairs),
+            time.perf_counter() - started,
+        )
+        self.stats.inc("metricx.success", value=len(scores))
+        return [float(x) for x in scores]
+
+    def _stop_metricx_worker(self) -> None:
+        with self._worker_lock:
+            proc = self._worker_proc
+            if proc is None:
+                return
+            try:
+                if proc.poll() is None and proc.stdin is not None:
+                    proc.stdin.write(json.dumps({"event": "shutdown"}) + "\n")
+                    proc.stdin.flush()
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+
+            self._worker_proc = None
+            self._worker_stdout_q = None
+            self._worker_stdout_thread = None
+            self._worker_stderr_thread = None
 
     def _score_metricx24_cli(self, pairs: list[tuple[str, str]]) -> list[float]:
         if not pairs:
@@ -193,6 +402,12 @@ class MetricXScorer:
                 "In the metricx env, pin fsspec to <2023.10.0 and retry: "
                 f"{python_bin} -m pip install 'fsspec<2023.10.0'"
             )
+        if "unable to avoid copy while creating an array as requested" in last_error.lower():
+            raise RuntimeError(
+                "MetricX runtime hit NumPy 2.x compatibility issue. "
+                "In the metricx env, pin numpy to <2 and retry: "
+                f"{python_bin} -m pip install 'numpy<2'"
+            )
         if "pyextensiontype" in last_error.lower():
             raise RuntimeError(
                 "MetricX runtime has incompatible pyarrow version for datasets==2.13.1. "
@@ -264,4 +479,5 @@ class MetricXScorer:
         return max(0.0, min(25.0, score))
 
     def close(self) -> None:
+        self._stop_metricx_worker()
         self.cache.close()
