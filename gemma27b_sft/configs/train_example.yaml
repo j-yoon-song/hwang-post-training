@@ -36,7 +36,7 @@ train:
   seed: 42
   num_train_epochs: 1.0
   max_steps: -1
-  global_batch_size: 64
+  global_batch_size: 16
   per_device_train_batch_size: 1
   per_device_eval_batch_size: 1
   learning_rate: 0.0001

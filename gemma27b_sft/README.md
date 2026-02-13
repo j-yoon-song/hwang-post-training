@@ -5,7 +5,7 @@ Full-parameter SFT project for `google/gemma-3-27b-it` on the synthetic translat
 This project enforces:
 - Optimizer: `Adafactor`
 - Learning rate: `1e-4`
-- Global batch size: `64`
+- Global batch size: configurable (default config uses `16`)
 - Trainable params: all parameters **except embeddings** (input embeddings frozen, output embeddings optionally frozen)
 
 ## 1) Setup (uv)
@@ -38,13 +38,13 @@ Default template matches:
 
 ## 3) Batch Size Rule
 
-Global batch is fixed to `64` and is checked at startup.
+Global batch is configurable and checked at startup.
 
 `gradient_accumulation_steps` is auto-computed:
 
-`gradient_accumulation_steps = 64 / (per_device_train_batch_size * WORLD_SIZE)`
+`gradient_accumulation_steps = global_batch_size / (per_device_train_batch_size * WORLD_SIZE)`
 
-So `64` must be divisible by `per_device_train_batch_size * WORLD_SIZE`.
+So `global_batch_size` must be divisible by `per_device_train_batch_size * WORLD_SIZE`.
 
 ## 4) Run Training
 
@@ -114,3 +114,4 @@ Check these first:
   - `WORLD_SIZE=8`
   - `train.max_seq_length=1024`
 - Keep `per_device_train_batch_size=1` for 27B full SFT.
+- If you need faster recovery from OOM/debug instability, lower `global_batch_size` (for example `16`).

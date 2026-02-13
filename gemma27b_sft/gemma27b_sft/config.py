@@ -53,7 +53,7 @@ class TrainConfig:
     seed: int = 42
     num_train_epochs: float = 1.0
     max_steps: int = -1
-    global_batch_size: int = 64
+    global_batch_size: int = 16
     per_device_train_batch_size: int = 1
     per_device_eval_batch_size: int = 1
     learning_rate: float = 1e-4
@@ -167,8 +167,8 @@ def load_config(path: str | Path) -> SFTConfig:
         raise FileNotFoundError(f"data.eval_file not found: {cfg.data.eval_file}")
     if cfg.train.learning_rate != 1e-4:
         raise ValueError("This project enforces Adafactor learning_rate=1e-4.")
-    if cfg.train.global_batch_size != 64:
-        raise ValueError("This project enforces global_batch_size=64.")
+    if cfg.train.global_batch_size <= 0:
+        raise ValueError("train.global_batch_size must be > 0.")
     if cfg.train.max_seq_length <= 0:
         raise ValueError("train.max_seq_length must be > 0")
     if cfg.train.expected_world_size is not None and cfg.train.expected_world_size <= 0:
