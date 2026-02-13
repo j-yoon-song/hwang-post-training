@@ -6,6 +6,7 @@ import logging
 import os
 import random
 import time
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,7 @@ from .bucketing import BalancedBucketSampler, assign_bucket
 from .caches import StageProgressStore
 from .config import PipelineConfig, dump_config, resolve_metricx_cache_path
 from .filters import apply_llm_judge_filter, apply_rule_based_filters
-from .io_utils import append_jsonl, ensure_dir, read_jsonl, write_jsonl
+from .io_utils import ensure_dir, read_jsonl, write_jsonl
 from .metricx import MetricXScorer
 from .prompts import build_translation_messages
 from .segmentation import Segment, build_blobs_from_doc_segments, extract_segments_from_record
@@ -439,50 +440,89 @@ class PipelineRunner:
             len(tasks),
             self.cfg.teacher.max_concurrency,
         )
-        results = self.teacher.run_tasks(
-            tasks=tasks,
-            worker_fn=lambda task, text: {"item_id": task.item_id, "text": text},
+        row_map = {row["source_id"]: row for row in chunk_rows}
+        scores_by_source: dict[str, dict[str, float]] = {}
+        by_source: dict[str, dict[str, str]] = {}
+        ready_sources: list[str] = []
+        dispatched_sources: set[str] = set()
+        source_batch_for_metric = max(
+            1,
+            min(len(chunk_rows), max(8, self.cfg.teacher.max_concurrency // 2)),
         )
+
+        def flush_metric_ready(force: bool = False) -> None:
+            nonlocal ready_sources
+            if not ready_sources:
+                return
+            if not force and len(ready_sources) < source_batch_for_metric:
+                return
+
+            batch_source_ids = ready_sources[:source_batch_for_metric]
+            ready_sources = ready_sources[source_batch_for_metric:]
+            pairs: list[tuple[str, str]] = []
+            score_index: list[tuple[str, str]] = []
+            for source_id in batch_source_ids:
+                texts = by_source[source_id]
+                source_text = row_map[source_id]["source_text"]
+                pairs.append((source_text, texts.get("greedy", "")))
+                score_index.append((source_id, "greedy"))
+                pairs.append((source_text, texts.get("sample", "")))
+                score_index.append((source_id, "sample"))
+
+            score_start = time.perf_counter()
+            logger.info(
+                "prefilter chunk metricx start pairs=%s ready_sources=%s",
+                len(pairs),
+                len(batch_source_ids),
+            )
+            scores = self.metricx.score_batch(pairs)
+            logger.info(
+                "prefilter chunk metricx done pairs=%s elapsed=%.2fs",
+                len(pairs),
+                time.perf_counter() - score_start,
+            )
+            for (source_id, mode), score in zip(score_index, scores):
+                scores_by_source.setdefault(source_id, {})[mode] = float(score)
+
+        workers = max(1, self.cfg.teacher.max_concurrency)
+        future_map: dict[Future[str], str] = {}
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for task in tasks:
+                future = executor.submit(
+                    self.teacher.complete,
+                    task.messages,
+                    task.temperature,
+                    task.top_p,
+                    task.max_tokens,
+                    task.model,
+                )
+                future_map[future] = task.item_id
+
+            for future in as_completed(future_map):
+                item_id = future_map[future]
+                text = future.result()
+                source_id, mode = item_id.split("::", maxsplit=1)
+                by_source.setdefault(source_id, {})[mode] = text
+                source_modes = by_source[source_id]
+                if "greedy" in source_modes and "sample" in source_modes and source_id not in dispatched_sources:
+                    ready_sources.append(source_id)
+                    dispatched_sources.add(source_id)
+                flush_metric_ready(force=False)
+
+        while ready_sources:
+            flush_metric_ready(force=True)
+
         t_teacher = time.perf_counter()
         logger.info(
-            "prefilter chunk teacher done rows=%s tasks=%s elapsed=%.2fs",
+            "prefilter chunk teacher+metricx overlapped done rows=%s tasks=%s elapsed=%.2fs",
             len(chunk_rows),
             len(tasks),
             t_teacher - t0,
         )
 
-        by_source: dict[str, dict[str, str]] = {}
-        for result in results:
-            source_id, mode = result["item_id"].split("::", maxsplit=1)
-            by_source.setdefault(source_id, {})[mode] = result["text"]
-
-        pairs: list[tuple[str, str]] = []
-        score_index: list[tuple[str, str]] = []
-        row_map = {row["source_id"]: row for row in chunk_rows}
-
-        for source_id, texts in by_source.items():
-            source_text = row_map[source_id]["source_text"]
-            greedy = texts.get("greedy", "")
-            sampled = texts.get("sample", "")
-            pairs.append((source_text, greedy))
-            score_index.append((source_id, "greedy"))
-            pairs.append((source_text, sampled))
-            score_index.append((source_id, "sample"))
-
-        logger.info("prefilter chunk metricx start pairs=%s", len(pairs))
-        scores = self.metricx.score_batch(pairs)
-        t_metricx = time.perf_counter()
-        logger.info(
-            "prefilter chunk metricx done pairs=%s elapsed=%.2fs",
-            len(pairs),
-            t_metricx - t_teacher,
-        )
-        scores_by_source: dict[str, dict[str, float]] = {}
-        for (source_id, mode), score in zip(score_index, scores):
-            scores_by_source.setdefault(source_id, {})[mode] = score
-
         written = 0
         processed_ids: list[str] = []
+        out_rows: list[dict[str, Any]] = []
         for source_id, row in row_map.items():
             greedy_text = by_source.get(source_id, {}).get("greedy", "")
             sample_text = by_source.get(source_id, {}).get("sample", "")
@@ -521,10 +561,11 @@ class PipelineRunner:
                     "backend": self.cfg.metricx.backend,
                 },
             }
-            append_jsonl(out_path, output)
+            out_rows.append(output)
             processed_ids.append(source_id)
             written += 1
 
+        write_jsonl(out_path, out_rows, append=True)
         self.progress.add_many(stage_name, processed_ids)
         logger.info(
             "prefilter chunk done size=%s written=%s progress=%s total_elapsed=%.2fs",
@@ -571,6 +612,7 @@ class PipelineRunner:
         selected = [heapq.heappop(heap)[2] for _ in range(len(heap))]
         selected.reverse()
 
+        output_rows: list[dict[str, Any]] = []
         for rank, row in enumerate(selected, start=1):
             row["selection"] = {
                 "selected": True,
@@ -578,7 +620,8 @@ class PipelineRunner:
                 "selection_score": row["prefilter"]["improvement"],
                 "selection_stage": "prefilter_improvement",
             }
-            append_jsonl(out_path, row)
+            output_rows.append(row)
+        write_jsonl(out_path, output_rows, append=False)
 
         logger.info("select_sources done seen=%s selected=%s", seen, len(selected))
         self.stats.inc("select.seen", seen)
@@ -636,6 +679,7 @@ class PipelineRunner:
                 )
 
                 processed_ids: list[str] = []
+                out_rows: list[dict[str, Any]] = []
                 for result in results:
                     item_id = result["item_id"]
                     candidate_idx = int(item_id.split("::", maxsplit=1)[1])
@@ -663,10 +707,11 @@ class PipelineRunner:
                             },
                         },
                     }
-                    append_jsonl(out_path, out_row)
+                    out_rows.append(out_row)
                     processed_ids.append(item_id)
                     total_written += 1
 
+                write_jsonl(out_path, out_rows, append=True)
                 self.progress.add_many(stage_name, processed_ids)
 
             if source_idx % 50 == 0:
@@ -691,6 +736,10 @@ class PipelineRunner:
 
         stage_name = "score_select_best"
         source_count = 0
+        flush_every = 200
+        out_rows_buffer: list[dict[str, Any]] = []
+        topk_rows_buffer: list[dict[str, Any]] = []
+        progress_ids: list[str] = []
 
         for source_id, group in self._iter_candidate_groups(in_path):
             if self.resume and out_path.exists() and self.progress.has(stage_name, source_id):
@@ -726,10 +775,9 @@ class PipelineRunner:
                 },
             }
 
-            append_jsonl(out_path, out_row)
+            out_rows_buffer.append(out_row)
             for row in top_k:
-                append_jsonl(
-                    topk_path,
+                topk_rows_buffer.append(
                     {
                         "source_id": source_id,
                         "candidate_index": row["candidate_index"],
@@ -738,12 +786,23 @@ class PipelineRunner:
                     },
                 )
 
-            self.progress.add(stage_name, source_id)
+            progress_ids.append(source_id)
             source_count += 1
+
+            if source_count % flush_every == 0:
+                write_jsonl(out_path, out_rows_buffer, append=True)
+                out_rows_buffer = []
+                write_jsonl(topk_path, topk_rows_buffer, append=True)
+                topk_rows_buffer = []
+                self.progress.add_many(stage_name, progress_ids)
+                progress_ids = []
 
             if source_count % 100 == 0:
                 logger.info("score_select_best progress sources=%s", source_count)
 
+        write_jsonl(out_path, out_rows_buffer, append=True)
+        write_jsonl(topk_path, topk_rows_buffer, append=True)
+        self.progress.add_many(stage_name, progress_ids)
         logger.info("score_select_best done sources=%s", source_count)
         self.stats.inc("score_select_best.sources", source_count)
 
@@ -779,6 +838,10 @@ class PipelineRunner:
         stage_name = "format_filter"
         passed = 0
         rejected = 0
+        flush_every = 200
+        pass_buffer: list[dict[str, Any]] = []
+        reject_buffer: list[dict[str, Any]] = []
+        progress_ids: list[str] = []
 
         for row in read_jsonl(in_path):
             source_id = row["source_id"]
@@ -790,8 +853,7 @@ class PipelineRunner:
             decision = apply_rule_based_filters(row["source_text"], row["target_text"], self.cfg.filters)
             if not decision.passed:
                 rejected += 1
-                append_jsonl(
-                    reject_path,
+                reject_buffer.append(
                     {
                         **row,
                         "filters": {
@@ -800,10 +862,17 @@ class PipelineRunner:
                             "notes": decision.notes,
                             "type": "rule_based",
                         },
-                    },
+                    }
                 )
                 self.stats.inc(f"filter.reject.{decision.reason_code}")
-                self.progress.add(stage_name, source_id)
+                progress_ids.append(source_id)
+                if len(progress_ids) >= flush_every:
+                    write_jsonl(out_path, pass_buffer, append=True)
+                    pass_buffer = []
+                    write_jsonl(reject_path, reject_buffer, append=True)
+                    reject_buffer = []
+                    self.progress.add_many(stage_name, progress_ids)
+                    progress_ids = []
                 continue
 
             if self.cfg.filters.llm_judge.enabled:
@@ -817,8 +886,7 @@ class PipelineRunner:
                 )
                 if not judge_decision.passed:
                     rejected += 1
-                    append_jsonl(
-                        reject_path,
+                    reject_buffer.append(
                         {
                             **row,
                             "filters": {
@@ -827,10 +895,17 @@ class PipelineRunner:
                                 "notes": judge_decision.notes,
                                 "type": "llm_judge",
                             },
-                        },
+                        }
                     )
                     self.stats.inc(f"filter.reject.{judge_decision.reason_code}")
-                    self.progress.add(stage_name, source_id)
+                    progress_ids.append(source_id)
+                    if len(progress_ids) >= flush_every:
+                        write_jsonl(out_path, pass_buffer, append=True)
+                        pass_buffer = []
+                        write_jsonl(reject_path, reject_buffer, append=True)
+                        reject_buffer = []
+                        self.progress.add_many(stage_name, progress_ids)
+                        progress_ids = []
                     continue
 
             passed += 1
@@ -843,13 +918,24 @@ class PipelineRunner:
                     "type": "rule_based+llm_judge" if self.cfg.filters.llm_judge.enabled else "rule_based",
                 },
             }
-            append_jsonl(out_path, out_row)
+            pass_buffer.append(out_row)
             self.stats.inc("filter.pass")
-            self.progress.add(stage_name, source_id)
+            progress_ids.append(source_id)
+
+            if len(progress_ids) >= flush_every:
+                write_jsonl(out_path, pass_buffer, append=True)
+                pass_buffer = []
+                write_jsonl(reject_path, reject_buffer, append=True)
+                reject_buffer = []
+                self.progress.add_many(stage_name, progress_ids)
+                progress_ids = []
 
             if (passed + rejected) % 200 == 0:
                 logger.info("format_filter progress processed=%s pass=%s reject=%s", passed + rejected, passed, rejected)
 
+        write_jsonl(out_path, pass_buffer, append=True)
+        write_jsonl(reject_path, reject_buffer, append=True)
+        self.progress.add_many(stage_name, progress_ids)
         logger.info("format_filter done pass=%s reject=%s", passed, rejected)
         self.stats.inc("filter.passed", passed)
         self.stats.inc("filter.rejected", rejected)
@@ -869,6 +955,8 @@ class PipelineRunner:
         total = 0
         len_source = []
         len_target = []
+        out_buffer: list[dict[str, Any]] = []
+        flush_every = 1000
 
         for row in read_jsonl(in_path):
             output = {
@@ -884,14 +972,18 @@ class PipelineRunner:
                 "metricx": row.get("metricx", {}),
                 "filters": row.get("filters", {}),
             }
-            append_jsonl(out_path, output)
+            out_buffer.append(output)
             total += 1
             len_source.append(len(row["source_text"]))
             len_target.append(len(row["target_text"]))
 
+            if len(out_buffer) >= flush_every:
+                write_jsonl(out_path, out_buffer, append=True)
+                out_buffer = []
             if total % 1000 == 0:
                 logger.info("export progress total=%s", total)
 
+        write_jsonl(out_path, out_buffer, append=True)
         logger.info("export done total=%s", total)
         self.stats.inc("export.total", total)
         if len_source:

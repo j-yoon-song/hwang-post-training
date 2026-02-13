@@ -75,10 +75,12 @@ class MetricXScorer:
                         "metricx backend '%s' is using heuristic fallback; scores are not MetricX.",
                         self.cfg.backend,
                     )
+            cache_batch: list[tuple[str, dict[str, float | str]]] = []
             for idx, score, pair in zip(uncached_indices, scores, uncached_pairs):
                 results[idx] = score
                 key = self._cache_key(pair[0], pair[1])
-                self.cache.set(key, {"score": score, "backend": self.cfg.backend})
+                cache_batch.append((key, {"score": float(score), "backend": self.cfg.backend}))
+            self.cache.set_many(cache_batch)
 
         return [float(x) if x is not None else 25.0 for x in results]
 

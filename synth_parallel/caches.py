@@ -18,6 +18,8 @@ class SQLiteKVCache:
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL;")
+        self._conn.execute("PRAGMA synchronous=NORMAL;")
+        self._conn.execute("PRAGMA temp_store=MEMORY;")
         self._conn.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {self.table_name} (
@@ -48,6 +50,20 @@ class SQLiteKVCache:
             )
             self._conn.commit()
 
+    def set_many(self, items: list[tuple[str, dict[str, Any]]]) -> None:
+        if not items:
+            return
+        rows = [
+            (key, json.dumps(value, ensure_ascii=False), time.time())
+            for key, value in items
+        ]
+        with self._lock:
+            self._conn.executemany(
+                f"INSERT OR REPLACE INTO {self.table_name}(cache_key, value_json, created_at) VALUES (?, ?, ?)",
+                rows,
+            )
+            self._conn.commit()
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -62,6 +78,8 @@ class StageProgressStore:
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL;")
+        self._conn.execute("PRAGMA synchronous=NORMAL;")
+        self._conn.execute("PRAGMA temp_store=MEMORY;")
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS stage_progress (
