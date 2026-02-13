@@ -91,7 +91,22 @@ def _resolve_attn_implementation(cfg: SFTConfig) -> str | None:
             "flash_attention_2 + FSDP activation checkpointing can trigger "
             "torch.utils.checkpoint.CheckpointError (metadata mismatch) on current stacks."
         )
-        return "sdpa"
+        resolved = "sdpa"
+
+    # Gemma 3 local-attention stacks can fail on some versions with sdpa
+    # under FSDP activation checkpointing (e.g. 1024 vs 2047 mask mismatch).
+    if (
+        resolved == "sdpa"
+        and "gemma-3" in cfg.model.name_or_path.lower()
+        and cfg.train.fsdp
+        and cfg.train.fsdp_activation_checkpointing
+    ):
+        logger.warning(
+            "Switching attention implementation to eager because "
+            "Gemma 3 + sdpa + FSDP activation checkpointing can hit "
+            "attention mask shape mismatch errors on current stacks."
+        )
+        resolved = "eager"
     return resolved
 
 

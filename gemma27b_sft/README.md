@@ -98,6 +98,8 @@ CONFIG_PATH=configs/train_8xh100_fsdp.yaml bash scripts/sample_infer.sh
   - Install with `uv pip install flash-attn --no-build-isolation` when your CUDA toolchain supports it.
   - For FSDP + activation checkpointing, this project forces `sdpa` to avoid known
     checkpoint metadata mismatch errors (for example tensor size `1024` vs `2047`).
+  - For Gemma 3 + FSDP activation checkpointing, this project then forces `eager`
+    when `sdpa` shows mask-shape mismatch (for example `1024` vs `2047`).
 - `train.fsdp`
   - Set to `full_shard auto_wrap` for 27B full fine-tuning on 8x H100.
 - `train.expected_world_size`
