@@ -73,12 +73,14 @@ From `gemma27b_sft` directory:
 ```bash
 bash scripts/sample_infer.sh
 ```
+This uses the same `data.prompt_template` as training (from config).
 
 Optional overrides:
 
 ```bash
 MODEL_DIR=../outputs/gemma3-27b-it-sft-fsdp/checkpoint-1000 bash scripts/sample_infer.sh
 SRC_TEXT="I love this project." bash scripts/sample_infer.sh
+CONFIG_PATH=configs/train_8xh100_fsdp.yaml bash scripts/sample_infer.sh
 ```
 
 ## 6) Config Notes
