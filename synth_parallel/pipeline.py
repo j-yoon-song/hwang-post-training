@@ -16,7 +16,7 @@ from .bucketing import BalancedBucketSampler, assign_bucket
 from .caches import StageProgressStore
 from .config import PipelineConfig, dump_config, resolve_metricx_cache_path
 from .filters import apply_llm_judge_filter, apply_rule_based_filters
-from .io_utils import append_jsonl, ensure_dir, read_jsonl
+from .io_utils import append_jsonl, ensure_dir, read_jsonl, write_jsonl
 from .metricx import MetricXScorer
 from .prompts import build_translation_messages
 from .segmentation import Segment, build_blobs_from_doc_segments, extract_segments_from_record
@@ -320,7 +320,7 @@ class PipelineRunner:
             )
 
         logger.info(
-            "sample_sources done docs=%s segments=%s sampled=%s (sentence=%s blob=%s)",
+            "sample_sources collection done docs=%s segments=%s sampled=%s (sentence=%s blob=%s). Writing output...",
             processed_docs,
             processed_segments,
             len(sampled),
@@ -328,8 +328,14 @@ class PipelineRunner:
             len(sampled_blobs),
         )
 
-        for row in sampled:
-            append_jsonl(out_path, row)
+        write_start = time.perf_counter()
+        written = write_jsonl(out_path, sampled, append=False)
+        logger.info(
+            "sample_sources write done rows=%s path=%s elapsed=%.2fs",
+            written,
+            out_path,
+            time.perf_counter() - write_start,
+        )
 
         for bid, st in sentence_stats.items():
             self.stats.inc(f"sample.bucket_sentence.{bid}.seen", st.seen)
@@ -339,7 +345,7 @@ class PipelineRunner:
             self.stats.inc(f"sample.bucket_blob.{bid}.kept", st.kept)
         self.stats.inc("sample.docs", processed_docs)
         self.stats.inc("sample.segments", processed_segments)
-        self.stats.inc("sample.output", len(sampled))
+        self.stats.inc("sample.output", written)
 
     def _segment_to_source_row(self, seg: Segment) -> dict[str, Any]:
         bucket_id = assign_bucket(seg.length_approx, self.cfg.bucketing.boundaries)
