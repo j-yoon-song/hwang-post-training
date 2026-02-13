@@ -87,8 +87,8 @@ CONFIG_PATH=configs/train_8xh100_fsdp.yaml bash scripts/sample_infer.sh
 
 - `model.freeze_output_embeddings: true`
   - Keeps output embeddings frozen too (if not tied to input embeddings)
-- `train.gradient_checkpointing: true` (non-FSDP runs)
-  - Recommended for memory reduction when FSDP activation checkpointing is not used.
+- `train.gradient_checkpointing: true`
+  - Recommended default for Gemma 3 FSDP runs in this project.
 - `train.max_seq_length: 1024` (default in provided configs)
   - 27B full SFT at 2048 can easily OOM even on 8x H100 depending on stack version.
   - Increase to 1536/2048 only after 1024 is stable.
@@ -96,10 +96,8 @@ CONFIG_PATH=configs/train_8xh100_fsdp.yaml bash scripts/sample_infer.sh
   - Uses `flash_attention_2` automatically when CUDA + `flash_attn` are available.
   - Falls back to `sdpa` automatically if FlashAttention is unavailable.
   - Install with `uv pip install flash-attn --no-build-isolation` when your CUDA toolchain supports it.
-  - For FSDP + activation checkpointing, this project forces `sdpa` to avoid known
-    checkpoint metadata mismatch errors (for example tensor size `1024` vs `2047`).
-  - For Gemma 3 + FSDP activation checkpointing, this project then forces `eager`
-    when `sdpa` shows mask-shape mismatch (for example `1024` vs `2047`).
+  - For Gemma 3 FSDP, this project disables FSDP activation checkpointing and keeps
+    HF gradient checkpointing to avoid known checkpoint/mask mismatch failures.
 - `train.fsdp`
   - Set to `full_shard auto_wrap` for 27B full fine-tuning on 8x H100.
 - `train.expected_world_size`
@@ -107,9 +105,10 @@ CONFIG_PATH=configs/train_8xh100_fsdp.yaml bash scripts/sample_infer.sh
 - `train.fsdp_transformer_layer_cls_to_wrap`
   - Set `auto` (recommended): class name is auto-detected from the loaded model.
 - `train.fsdp_limit_all_gathers`, `train.fsdp_activation_checkpointing`
-  - Enabled in `train_8xh100_fsdp.yaml` to reduce peak memory.
-  - When `train.fsdp_activation_checkpointing=true`, HF `gradient_checkpointing` must be `false`.
-    The CLI enforces this automatically if both are set to `true`.
+  - Memory/activation checkpoint controls for FSDP.
+  - Generic rule: when `train.fsdp_activation_checkpointing=true`, HF `gradient_checkpointing` must be `false`.
+    The CLI enforces this automatically.
+  - Gemma 3 rule: `train.fsdp_activation_checkpointing` is forced to `false` at runtime for stability.
 - `data.source_lang_code`, `data.target_lang_code`
   - Set fixed language codes (example: `en`, `ko`).
   - WMT-style codes are supported directly; unknown codes are still accepted.

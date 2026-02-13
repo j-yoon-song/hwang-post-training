@@ -1,7 +1,7 @@
 model:
   name_or_path: google/gemma-3-27b-it
   trust_remote_code: false
-  attn_implementation: eager
+  attn_implementation: auto
   freeze_output_embeddings: true
 
 data:
@@ -46,7 +46,7 @@ train:
   max_seq_length: 1024
   bf16: true
   tf32: true
-  gradient_checkpointing: false
+  gradient_checkpointing: true
   dataloader_num_workers: 4
   logging_steps: 10
   save_steps: 500
@@ -63,6 +63,6 @@ train:
   fsdp_cpu_offload: false
   fsdp_use_orig_params: true
   fsdp_limit_all_gathers: true
-  fsdp_activation_checkpointing: true
+  fsdp_activation_checkpointing: false
   fsdp_sync_module_states: true
   fsdp_cpu_ram_efficient_loading: true

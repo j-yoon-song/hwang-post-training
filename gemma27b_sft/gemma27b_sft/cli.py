@@ -92,22 +92,30 @@ def _resolve_attn_implementation(cfg: SFTConfig) -> str | None:
             "torch.utils.checkpoint.CheckpointError (metadata mismatch) on current stacks."
         )
         resolved = "sdpa"
-
-    # Gemma 3 local-attention stacks can fail on some versions with sdpa
-    # under FSDP activation checkpointing (e.g. 1024 vs 2047 mask mismatch).
-    if (
-        resolved == "sdpa"
-        and "gemma-3" in cfg.model.name_or_path.lower()
-        and cfg.train.fsdp
-        and cfg.train.fsdp_activation_checkpointing
-    ):
-        logger.warning(
-            "Switching attention implementation to eager because "
-            "Gemma 3 + sdpa + FSDP activation checkpointing can hit "
-            "attention mask shape mismatch errors on current stacks."
-        )
-        resolved = "eager"
     return resolved
+
+
+def _apply_runtime_compat_overrides(cfg: SFTConfig) -> None:
+    model_name = cfg.model.name_or_path.lower()
+    if "gemma-3" not in model_name or not cfg.train.fsdp:
+        return
+
+    requested_attn = (cfg.model.attn_implementation or "auto").strip().lower()
+    if requested_attn == "eager":
+        logger.warning(
+            "attn_implementation=eager is unstable for Gemma 3 FSDP training "
+            "(can trigger 1024/2047 attention-mask mismatch). Switching to auto."
+        )
+        cfg.model.attn_implementation = "auto"
+
+    if cfg.train.fsdp_activation_checkpointing:
+        logger.warning(
+            "Disabling train.fsdp_activation_checkpointing for Gemma 3 FSDP run. "
+            "Using HF gradient_checkpointing instead to avoid checkpoint/mask mismatch errors."
+        )
+        cfg.train.fsdp_activation_checkpointing = False
+        if not cfg.train.gradient_checkpointing:
+            cfg.train.gradient_checkpointing = True
 
 
 def _load_model(cfg: SFTConfig):
@@ -316,6 +324,7 @@ def _validate_launch(cfg: SFTConfig) -> None:
 def run(cfg: SFTConfig) -> None:
     output_dir = Path(cfg.train.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    _apply_runtime_compat_overrides(cfg)
     dump_config(cfg, output_dir / "resolved_config.yaml")
     _validate_launch(cfg)
 
