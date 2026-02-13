@@ -9,10 +9,17 @@ import os
 from pathlib import Path
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, Adafactor, Trainer, TrainingArguments
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    Adafactor,
+    DataCollatorForTokenClassification,
+    Trainer,
+    TrainingArguments,
+)
 
 from .config import SFTConfig, compute_gradient_accumulation_steps, dump_config, load_config
-from .data import CompletionDataCollator, build_datasets
+from .data import build_datasets
 
 
 logger = logging.getLogger(__name__)
@@ -277,7 +284,7 @@ def _build_trainer(
     train_ds,
     eval_ds,
     tokenizer,
-    collator: CompletionDataCollator,
+    collator,
 ) -> FixedAdafactorTrainer:
     trainer_params = set(inspect.signature(FixedAdafactorTrainer.__init__).parameters)
     kwargs: dict[str, object] = {
@@ -379,7 +386,13 @@ def run(cfg: SFTConfig) -> None:
         has_eval=eval_ds is not None,
         hf_gradient_checkpointing=use_hf_gradient_ckpt,
     )
-    collator = CompletionDataCollator(tokenizer=tokenizer)
+    collator = DataCollatorForTokenClassification(
+        tokenizer=tokenizer,
+        padding=True,
+        pad_to_multiple_of=8,
+        label_pad_token_id=-100,
+        return_tensors="pt",
+    )
 
     trainer = _build_trainer(
         model=model,

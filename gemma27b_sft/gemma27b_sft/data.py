@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -380,6 +379,7 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
         return {
             "input_ids": full_ids,
             "attention_mask": [1] * len(full_ids),
+            "token_type_ids": [0] * len(full_ids),
             "labels": labels,
             "num_target_tokens": non_ignored,
             "prompt_tokens": len(prompt_ids),
@@ -391,65 +391,6 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
         }
 
     return _tokenize
-
-
-@dataclass
-class CompletionDataCollator:
-    tokenizer: PreTrainedTokenizerBase
-    pad_to_multiple_of: int | None = 8
-
-    def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
-        normalized_features = []
-        for idx, feature in enumerate(features):
-            try:
-                input_ids = _coerce_token_ids(feature.get("input_ids"), "input_ids")
-                attention_mask = _coerce_token_ids(feature.get("attention_mask"), "attention_mask")
-                labels = _coerce_token_ids(feature.get("labels"), "labels")
-                token_type_ids = _coerce_token_ids(feature.get("token_type_ids"), "token_type_ids")
-                if not token_type_ids:
-                    token_type_ids = [0] * len(input_ids)
-                elif len(token_type_ids) < len(input_ids):
-                    token_type_ids = token_type_ids + ([0] * (len(input_ids) - len(token_type_ids)))
-                elif len(token_type_ids) > len(input_ids):
-                    token_type_ids = token_type_ids[: len(input_ids)]
-            except Exception as exc:  # pylint: disable=broad-except
-                raise ValueError(
-                    f"Feature normalization failed at batch_index={idx}: {exc}. "
-                    f"feature_keys={list(feature.keys())}"
-                ) from exc
-            normalized_features.append(
-                {
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask,
-                    "labels": labels,
-                    "token_type_ids": token_type_ids,
-                }
-            )
-
-        batch_inputs = [
-            {
-                "input_ids": f["input_ids"],
-                "attention_mask": f["attention_mask"],
-                "token_type_ids": f["token_type_ids"],
-            }
-            for f in normalized_features
-        ]
-        padded = self.tokenizer.pad(
-            batch_inputs,
-            return_tensors="pt",
-            pad_to_multiple_of=self.pad_to_multiple_of,
-        )
-        if "token_type_ids" not in padded:
-            padded["token_type_ids"] = torch.zeros_like(padded["input_ids"], dtype=torch.long)
-        else:
-            padded["token_type_ids"] = padded["token_type_ids"].to(dtype=torch.long)
-        seq_len = int(padded["input_ids"].shape[1])
-        labels = []
-        for feature in normalized_features:
-            raw = feature["labels"]
-            labels.append(raw + [-100] * (seq_len - len(raw)))
-        padded["labels"] = torch.tensor(labels, dtype=torch.long)
-        return padded
 
 
 def _safe_string(value: Any) -> str:
@@ -641,7 +582,7 @@ def _tokenize_dataset(
 
 
 def _to_training_dataset(dataset: Dataset) -> Dataset:
-    keep_cols = {"input_ids", "attention_mask", "labels"}
+    keep_cols = {"input_ids", "attention_mask", "token_type_ids", "labels"}
     drop_cols = [name for name in dataset.column_names if name not in keep_cols]
     if drop_cols:
         dataset = dataset.remove_columns(drop_cols)
