@@ -13,7 +13,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     Adafactor,
-    DataCollatorForSeq2Seq,
+    DataCollatorForLanguageModeling,
     Trainer,
     TrainingArguments,
 )
@@ -336,8 +336,7 @@ def run(cfg: SFTConfig) -> None:
     _validate_launch(cfg)
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.name_or_path, use_fast=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.pad_token = tokenizer.eos_token
 
     train_ds, eval_ds = build_datasets(cfg, tokenizer)
     if len(train_ds) == 0:
@@ -386,12 +385,10 @@ def run(cfg: SFTConfig) -> None:
         has_eval=eval_ds is not None,
         hf_gradient_checkpointing=use_hf_gradient_ckpt,
     )
-    collator = DataCollatorForSeq2Seq(
+    collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
-        padding=True,
-        model=model,
+        mlm=False,
         pad_to_multiple_of=8,
-        label_pad_token_id=-100,
         return_tensors="pt",
     )
 
