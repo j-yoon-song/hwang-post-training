@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from .config import FiltersConfig
 from .prompts import build_judge_messages, parse_judge_json
@@ -53,14 +54,35 @@ def apply_llm_judge_filter(
     cfg: FiltersConfig,
 ) -> FilterDecision:
     messages = build_judge_messages(source_lang, target_lang, source_text, target_text)
+    generation_cfg = teacher.cfg.generation
+    temperature = (
+        float(generation_cfg.sampling_temperature)
+        if generation_cfg.sampling_temperature is not None
+        else float(cfg.llm_judge.temperature)
+    )
+    top_p = (
+        float(generation_cfg.sampling_top_p)
+        if generation_cfg.sampling_top_p is not None
+        else float(generation_cfg.top_p)
+    )
+    presence_penalty = generation_cfg.sampling_presence_penalty
+    sampling_extra_body: dict[str, Any] = {}
+    if generation_cfg.sampling_top_k is not None:
+        sampling_extra_body["top_k"] = int(generation_cfg.sampling_top_k)
+    if generation_cfg.sampling_min_p is not None:
+        sampling_extra_body["min_p"] = float(generation_cfg.sampling_min_p)
+    if generation_cfg.sampling_repetition_penalty is not None:
+        sampling_extra_body["repetition_penalty"] = float(generation_cfg.sampling_repetition_penalty)
 
     try:
         content = teacher.complete(
             messages=messages,
-            temperature=cfg.llm_judge.temperature,
-            top_p=1.0,
+            temperature=temperature,
+            top_p=top_p,
             max_tokens=cfg.llm_judge.max_tokens,
             model=cfg.llm_judge.model,
+            presence_penalty=presence_penalty,
+            extra_body=sampling_extra_body or None,
         )
     except Exception as exc:  # pylint: disable=broad-except
         if cfg.llm_judge.fail_policy == "permissive":
