@@ -1,0 +1,122 @@
+model:
+  policy_name_or_path: ../outputs/gemma3-27b-it-sft
+  reference_name_or_path: ../outputs/gemma3-27b-it-sft
+  tokenizer_name_or_path: null
+  trust_remote_code: false
+  attn_implementation: auto
+  use_fast_tokenizer: true
+  reference_device: cpu
+
+data:
+  train_file: ../runs/exp001/final_dataset.jsonl
+  eval_file: null
+  hf_dataset_name: null
+  hf_dataset_config_name: null
+  hf_train_split: train
+  hf_eval_split: null
+  hf_revision: null
+  hf_streaming: false
+  split_field: null
+  train_split: null
+  eval_split: null
+  limit: 64
+  eval_limit: 32
+
+  id_field: id
+  src_text_field: source_text
+  src_lang_field: src_lang
+  tgt_lang_field: tgt_lang
+  src_lang_code_field: src_lang_code
+  tgt_lang_code_field: tgt_lang_code
+  ref_text_field: target_text
+  is_bad_source_field: is_bad_source
+  skip_bad_source: false
+
+  default_src_lang: English
+  default_tgt_lang: Korean
+  default_src_lang_code: en
+  default_tgt_lang_code: ko
+
+prompt:
+  template: "You are a professional {source_lang} ({src_lang_code}) to {target_lang} ({tgt_lang_code}) translator. Your goal is to accurately convey the meaning and nuances of the original {source_lang} text while adhering to {target_lang} grammar, vocabulary, and cultural sensitivities. Produce only the {target_lang} translation, without any additional explanations or commentary. Please translate the following {source_lang} text into {target_lang}:\\n\\n{text}"
+
+generation:
+  max_new_tokens: 128
+  temperature: 0.8
+  top_p: 0.95
+  top_k: 50
+  num_samples_per_prompt: 2
+  do_sample: true
+  repetition_penalty: 1.0
+
+reward:
+  w_metricx: 1.0
+  w_xcomet_seq: 0.0
+  xcomet_seq_scale: 1.0
+  severity_weights:
+    MINOR: -1.0
+    MAJOR: -5.0
+    CRITICAL: -10.0
+  overlap_policy: any_overlap
+  majority_threshold: 0.5
+  use_confidence: false
+  span_combine_policy: sum
+  cache_enabled: true
+
+  metricx:
+    enabled: true
+    model_name: google/metricx-24-hybrid-large-v2p6
+    tokenizer_name: google/mt5-xl
+    use_reference: false
+    batch_size: 4
+    device: cuda
+    dtype: bfloat16
+    max_input_length: 2048
+    overflow_policy: truncate
+    offset: 5.0
+
+  xcomet:
+    enabled: true
+    model_name: Unbabel/XCOMET-XL
+    batch_size: 2
+    device: cuda
+    use_reference: false
+
+rl:
+  algorithm: grpo
+  lr: 1.0e-6
+  weight_decay: 0.0
+  batch_size: 2
+  grad_accum: 1
+  clip_eps: 0.2
+  kl_coef: 0.01
+  entropy_coef: 0.0
+  max_grad_norm: 1.0
+  ppo_epochs: 1
+  updates: 20
+  normalize_advantage: true
+  group_normalize: true
+  group_advantage_coef: 1.0
+  eps: 1.0e-8
+
+eval:
+  eval_every_n_updates: 5
+  eval_limit: 32
+  run_before_train: true
+
+logging:
+  output_dir: ./outputs/grpo-toy
+  jsonl_name: train_log.jsonl
+  rollout_jsonl_name: train_rollouts.jsonl
+  save_rollouts: false
+  eval_output_jsonl_name: eval_outputs.jsonl
+  save_eval_outputs: true
+  save_every_n_updates: 10
+
+misc:
+  seed: 42
+  device: cuda
+  dtype: bfloat16
+  huggingface_cache_dir: /media/sdd3
+  huggingface_token: null
+  huggingface_token_env: HF_TOKEN

@@ -1,0 +1,17 @@
+.venv/
+.venv_fix/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Local HF / training artifact dirs we don't want in git
+configs/outputs/
+
+# Keep lightweight logs in configs/gemma27_rl_outputs, but block heavy checkpoints
+configs/gemma27_rl_outputs/**/checkpoint-*/
+configs/gemma27_rl_outputs/**/best/
+configs/gemma27_rl_outputs/**/*.safetensors
+configs/gemma27_rl_outputs/**/optimizer.pt
+configs/gemma27_rl_outputs/**/*.bin

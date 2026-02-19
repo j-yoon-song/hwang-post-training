@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gemma27-rl"
+version = "0.1.0"
+description = "GRPO-style RL post-training pipeline for Gemma translation models"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "PyYAML>=6.0.1",
+  "datasets>=2.21.0",
+  "sentencepiece>=0.2.0",
+  "torch>=2.2.0",
+  "transformers>=4.44.0",
+]
+
+[project.optional-dependencies]
+reward = [
+  "unbabel-comet>=2.2.0",
+]
+test = [
+  "pytest>=8.0.0",
+]
+
+[project.scripts]
+gemma27_rl = "gemma27_rl.cli:main"
+
+[tool.setuptools]
+packages = ["gemma27_rl"]
