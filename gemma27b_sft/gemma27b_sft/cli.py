@@ -38,6 +38,26 @@ class FixedAdafactorTrainer(Trainer):
             )
         return self.optimizer
 
+    def _save_optimizer_and_scheduler(self, *args, **kwargs):
+        try:
+            return super()._save_optimizer_and_scheduler(*args, **kwargs)
+        except AssertionError as exc:
+            # FSDP + Adafactor can fail to gather optimizer state due to per-rank
+            # RMS state divergence. Keep model checkpointing progressing.
+            fsdp_enabled = bool(getattr(self.args, "fsdp", None))
+            err = str(exc)
+            known_mismatch = "different values for RMS" in err or (
+                "different values for" in err and "RMS" in err
+            )
+            if fsdp_enabled and known_mismatch:
+                logger.warning(
+                    "Skipping optimizer/scheduler state save due to known FSDP+Adafactor "
+                    "optimizer-state mismatch: %s",
+                    err,
+                )
+                return None
+            raise
+
 
 def _setup_logging() -> None:
     logging.basicConfig(
@@ -199,6 +219,12 @@ def _build_training_arguments(
         layer_cls = cfg.train.fsdp_transformer_layer_cls_to_wrap
         if layer_cls and layer_cls.strip().lower() not in {"", "auto"}:
             kwargs["fsdp_config"]["transformer_layer_cls_to_wrap"] = [layer_cls]
+        if "save_only_model" in ta_params:
+            kwargs["save_only_model"] = True
+            logger.warning(
+                "Enabling save_only_model for FSDP runs to avoid optimizer-state "
+                "save failures with Adafactor. Resume will reload model weights only."
+            )
     eval_mode = "steps" if has_eval else "no"
     if "evaluation_strategy" in ta_params:
         kwargs["evaluation_strategy"] = eval_mode
