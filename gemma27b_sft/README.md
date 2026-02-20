@@ -18,8 +18,9 @@ uv pip install -r requirements.txt
 uv pip install -e .
 ```
 
-Training preprocessing uses Hugging Face `datasets` (version-pinned in
-`requirements.txt` and `pyproject.toml`).
+Training preprocessing uses Hugging Face `datasets`
+(`>=2.21.0,<5.0.0`; supports 4.x).
+When using `datasets` 4.x, use `pyarrow>=21.0.0`.
 
 ## 2) Prepare Data
 
@@ -36,6 +37,48 @@ Set it in `configs/train_example.yaml`:
 Prompt formatting is configurable with `data.prompt_template`.
 Default template matches:
 - `{source_lang}`, `{src_lang_code}`, `{target_lang}`, `{tgt_lang_code}`, `{text}`
+
+### Optional: Split `final_dataset.jsonl` into Train/Eval (95:5)
+
+If you only have one file (for example `final_dataset.jsonl`), use:
+
+```bash
+cd gemma27b_sft
+python3 scripts/split_jsonl.py /path/to/final_dataset.jsonl
+```
+
+Defaults:
+- `eval_ratio=0.05`
+- `seed=42`
+- output names:
+  - `*_train_95.jsonl`
+  - `*_eval_5.jsonl`
+
+Example output:
+- `/path/to/final_dataset_train_95.jsonl`
+- `/path/to/final_dataset_eval_5.jsonl`
+
+Useful options:
+
+```bash
+python3 scripts/split_jsonl.py /path/to/final_dataset.jsonl --eval-ratio 0.05 --seed 42 --output-dir /path/to/out --force
+```
+
+Then set both files in config:
+
+```yaml
+data:
+  train_file: /path/to/final_dataset_train_95.jsonl
+  eval_file: /path/to/final_dataset_eval_5.jsonl
+```
+
+If `data.eval_file` is empty/null:
+- training still runs normally
+- eval is disabled (`evaluation_strategy=no`)
+- `eval_steps` is effectively ignored
+
+If `data.eval_file` is set but the file does not exist:
+- startup fails with `FileNotFoundError`
 
 ## 3) Batch Size Rule
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from .config import DataConfig, SFTConfig
 
 
 logger = logging.getLogger(__name__)
+_ESCAPED_NEWLINE_RE = re.compile(r"\\r\\n|\\n|\\r")
 
 
 _WMT_LANGUAGE_NAMES: dict[str, str] = {
@@ -403,6 +405,13 @@ def _safe_string(value: Any) -> str:
     return str(value)
 
 
+def _restore_escaped_newlines(text: str) -> tuple[str, int]:
+    if "\\" not in text:
+        return text, 0
+    restored, replaced = _ESCAPED_NEWLINE_RE.subn("\n", text)
+    return restored, replaced
+
+
 def _required_json_fields(cfg: DataConfig) -> list[str]:
     fields = [cfg.source_field, cfg.target_field]
     for name in [
@@ -428,6 +437,8 @@ def _safe_load_json_dataset(path: str, cfg: DataConfig) -> Dataset:
         "rows": 0,
         "non_string_counts": {field: 0 for field in required_fields},
         "missing_counts": {field: 0 for field in required_fields},
+        "source_escaped_newline_rows": 0,
+        "source_escaped_newline_replacements": 0,
         "sample_cast_logs": 0,
     }
 
@@ -462,7 +473,13 @@ def _safe_load_json_dataset(path: str, cfg: DataConfig) -> Dataset:
                                 type(value).__name__,
                             )
                             stats["sample_cast_logs"] += 1
-                    out[field] = _safe_string(value)
+                    text_value = _safe_string(value)
+                    if field == cfg.source_field:
+                        text_value, replaced = _restore_escaped_newlines(text_value)
+                        if replaced > 0:
+                            stats["source_escaped_newline_rows"] += 1
+                            stats["source_escaped_newline_replacements"] += replaced
+                    out[field] = text_value
                 stats["rows"] += 1
                 if stats["rows"] % 50000 == 0:
                     logger.info("JSON->datasets progress path=%s rows=%s", path, stats["rows"])
@@ -482,6 +499,12 @@ def _safe_load_json_dataset(path: str, cfg: DataConfig) -> Dataset:
         stats["non_string_counts"],
         stats["missing_counts"],
     )
+    if stats["source_escaped_newline_rows"] > 0:
+        logger.info(
+            "Restored escaped newlines in source field rows=%s replacements=%s",
+            stats["source_escaped_newline_rows"],
+            stats["source_escaped_newline_replacements"],
+        )
     return ds
 
 
