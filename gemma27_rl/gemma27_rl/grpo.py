@@ -34,22 +34,22 @@ def _align_tensors(
     old_logprobs: list[float],
     advantages: list[float],
     ref_logprobs: list[float] | None,
-    device: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    target_device = new_logprobs.device
     length = min(len(new_logprobs), len(old_logprobs), len(advantages))
     if ref_logprobs is not None:
         length = min(length, len(ref_logprobs))
 
     if length <= 0:
-        empty = torch.empty(0, device=device, dtype=new_logprobs.dtype)
+        empty = torch.empty(0, device=target_device, dtype=new_logprobs.dtype)
         return empty, empty, empty, None
 
     new_lp = new_logprobs[:length]
-    old_lp = torch.tensor(old_logprobs[:length], device=device, dtype=new_logprobs.dtype)
-    adv = torch.tensor(advantages[:length], device=device, dtype=new_logprobs.dtype)
+    old_lp = torch.tensor(old_logprobs[:length], device=target_device, dtype=new_logprobs.dtype)
+    adv = torch.tensor(advantages[:length], device=target_device, dtype=new_logprobs.dtype)
     ref_lp = None
     if ref_logprobs is not None:
-        ref_lp = torch.tensor(ref_logprobs[:length], device=device, dtype=new_logprobs.dtype)
+        ref_lp = torch.tensor(ref_logprobs[:length], device=target_device, dtype=new_logprobs.dtype)
     return new_lp, old_lp, adv, ref_lp
 
 
@@ -97,7 +97,6 @@ def update_policy(
             old_logprobs=rollout.old_logprobs,
             advantages=adv_row,
             ref_logprobs=rollout.ref_logprobs,
-            device=device,
         )
         if new_lp.numel() == 0:
             continue
@@ -150,9 +149,9 @@ def update_policy(
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
-    loss = torch.tensor(total_loss_value / total_tokens, device=device)
-    if not torch.isfinite(loss):
-        raise RuntimeError(f"Non-finite loss detected: {loss.item()}")
+    mean_loss = float(total_loss_value / total_tokens)
+    if not math.isfinite(mean_loss):
+        raise RuntimeError(f"Non-finite loss detected: {mean_loss}")
 
     mean_clip = total_clip / max(1, total_tokens)
     mean_approx_kl = total_approx_kl / max(1, total_tokens)
@@ -160,7 +159,7 @@ def update_policy(
     mean_ref_kl = total_ref_kl / max(1, total_tokens)
 
     stats = TrainStats(
-        policy_loss=float(loss.detach().cpu().item()),
+        policy_loss=mean_loss,
         approx_kl=float(mean_approx_kl),
         clip_fraction=float(mean_clip),
         entropy=float(mean_entropy),

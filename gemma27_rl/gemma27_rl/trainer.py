@@ -56,6 +56,35 @@ def _parse_cuda_index(device: str | None) -> int | None:
     return None
 
 
+def _normalize_gpu_id_list(raw_ids: list[int] | None) -> list[int]:
+    out: list[int] = []
+    seen: set[int] = set()
+    for idx in raw_ids or []:
+        value = int(idx)
+        if value < 0:
+            raise ValueError(f"GPU index must be >= 0, got {value}")
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _pick_free_gpu(
+    preferred: int | None,
+    used: set[int],
+    device_count: int,
+) -> int:
+    if preferred is not None and 0 <= preferred < device_count and preferred not in used:
+        return preferred
+    for cand in range(device_count):
+        if cand not in used:
+            return cand
+    if preferred is not None and 0 <= preferred < device_count:
+        return preferred
+    return 0
+
+
 def _assign_disjoint_gpu_devices(cfg: RLPostTrainConfig) -> None:
     if not torch.cuda.is_available():
         return
@@ -66,6 +95,56 @@ def _assign_disjoint_gpu_devices(cfg: RLPostTrainConfig) -> None:
 
     def _is_cuda_text(value: str | None) -> bool:
         return bool(value) and str(value).strip().lower().startswith("cuda")
+
+    explicit_policy_ids = _normalize_gpu_id_list(cfg.model.policy_gpu_ids)
+    explicit_reference_ids = _normalize_gpu_id_list(cfg.model.reference_gpu_ids)
+
+    if explicit_policy_ids or explicit_reference_ids:
+        for idx in explicit_policy_ids + explicit_reference_ids:
+            if idx >= device_count:
+                raise ValueError(
+                    f"Configured GPU index out of range: {idx} (cuda_count={device_count})"
+                )
+
+        used: set[int] = set(explicit_policy_ids) | set(explicit_reference_ids)
+
+        if _is_cuda_text(cfg.misc.device):
+            if not explicit_policy_ids:
+                explicit_policy_ids = [_pick_free_gpu(preferred=0, used=used, device_count=device_count)]
+                used.update(explicit_policy_ids)
+            cfg.misc.device = f"cuda:{explicit_policy_ids[0]}"
+        cfg.model.policy_gpu_ids = explicit_policy_ids
+
+        if explicit_reference_ids:
+            cfg.model.reference_device = f"cuda:{explicit_reference_ids[0]}"
+        cfg.model.reference_gpu_ids = explicit_reference_ids
+
+        if cfg.reward.metricx.enabled and _is_cuda_text(cfg.reward.metricx.device):
+            metricx_idx = _pick_free_gpu(
+                preferred=_parse_cuda_index(cfg.reward.metricx.device),
+                used=used,
+                device_count=device_count,
+            )
+            used.add(metricx_idx)
+            cfg.reward.metricx.device = f"cuda:{metricx_idx}"
+
+        if cfg.reward.xcomet.enabled and _is_cuda_text(cfg.reward.xcomet.device):
+            xcomet_idx = _pick_free_gpu(
+                preferred=_parse_cuda_index(cfg.reward.xcomet.device),
+                used=used,
+                device_count=device_count,
+            )
+            used.add(xcomet_idx)
+            cfg.reward.xcomet.device = f"cuda:{xcomet_idx}"
+
+        logger.info(
+            "Applied explicit GPU partition: policy_gpu_ids=%s reference_gpu_ids=%s metricx=%s xcomet=%s",
+            cfg.model.policy_gpu_ids,
+            cfg.model.reference_gpu_ids,
+            cfg.reward.metricx.device,
+            cfg.reward.xcomet.device,
+        )
+        return
 
     components: list[dict[str, Any]] = [
         {"name": "policy", "enabled": _is_cuda_text(cfg.misc.device), "raw": cfg.misc.device, "required": True},
@@ -223,6 +302,52 @@ def _resolve_model_dtype_and_attn(
     return dtype, None
 
 
+def _build_max_memory_map(device_ids: list[int]) -> dict[int | str, str]:
+    if not device_ids or torch is None or not torch.cuda.is_available():
+        return {}
+    max_memory: dict[int | str, str] = {}
+    for idx in device_ids:
+        total_bytes = int(torch.cuda.get_device_properties(idx).total_memory)
+        usable_bytes = int(total_bytes * 0.92)
+        gib = max(1, usable_bytes // (1024**3))
+        max_memory[idx] = f"{gib}GiB"
+    max_memory["cpu"] = "256GiB"
+    return max_memory
+
+
+def _load_causal_lm(
+    model_name_or_path: str,
+    kwargs: dict[str, Any],
+    single_device: str,
+    gpu_ids: list[int],
+    component_name: str,
+) -> AutoModelForCausalLM:
+    explicit_gpu_ids = _normalize_gpu_id_list(gpu_ids)
+    if len(explicit_gpu_ids) <= 1:
+        model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **kwargs)
+        model.to(single_device)
+        return model
+
+    max_memory = _build_max_memory_map(explicit_gpu_ids)
+    mp_kwargs = dict(kwargs)
+    mp_kwargs["device_map"] = "auto"
+    if max_memory:
+        mp_kwargs["max_memory"] = max_memory
+
+    logger.info(
+        "Loading %s model with model-parallel device_map=auto on GPUs=%s",
+        component_name,
+        explicit_gpu_ids,
+    )
+    try:
+        return AutoModelForCausalLM.from_pretrained(model_name_or_path, **mp_kwargs)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to load {component_name} model with multi-GPU partition {explicit_gpu_ids}. "
+            "Check accelerate/transformers versions and model size."
+        ) from exc
+
+
 def _load_policy_model(cfg: RLPostTrainConfig, device: str) -> AutoModelForCausalLM:
     dtype, attn_impl = _resolve_model_dtype_and_attn(cfg, device)
 
@@ -234,9 +359,13 @@ def _load_policy_model(cfg: RLPostTrainConfig, device: str) -> AutoModelForCausa
     if attn_impl:
         kwargs["attn_implementation"] = attn_impl
 
-    model = AutoModelForCausalLM.from_pretrained(cfg.model.policy_name_or_path, **kwargs)
-    model.to(device)
-    return model
+    return _load_causal_lm(
+        model_name_or_path=cfg.model.policy_name_or_path,
+        kwargs=kwargs,
+        single_device=device,
+        gpu_ids=cfg.model.policy_gpu_ids,
+        component_name="policy",
+    )
 
 
 def _load_reference_model(cfg: RLPostTrainConfig, default_device: str) -> tuple[AutoModelForCausalLM | None, str | None]:
@@ -244,7 +373,11 @@ def _load_reference_model(cfg: RLPostTrainConfig, default_device: str) -> tuple[
         return None, None
 
     ref_name = cfg.model.reference_name_or_path or cfg.model.policy_name_or_path
-    ref_device = resolve_device(cfg.model.reference_device or default_device)
+    reference_gpu_ids = _normalize_gpu_id_list(cfg.model.reference_gpu_ids)
+    if reference_gpu_ids:
+        ref_device = resolve_device(f"cuda:{reference_gpu_ids[0]}")
+    else:
+        ref_device = resolve_device(cfg.model.reference_device or default_device)
 
     dtype, attn_impl = _resolve_model_dtype_and_attn(cfg, ref_device)
 
@@ -256,8 +389,13 @@ def _load_reference_model(cfg: RLPostTrainConfig, default_device: str) -> tuple[
     if attn_impl:
         kwargs["attn_implementation"] = attn_impl
 
-    model = AutoModelForCausalLM.from_pretrained(ref_name, **kwargs)
-    model.to(ref_device)
+    model = _load_causal_lm(
+        model_name_or_path=ref_name,
+        kwargs=kwargs,
+        single_device=ref_device,
+        gpu_ids=reference_gpu_ids,
+        component_name="reference",
+    )
     model.eval()
     for p in model.parameters():
         p.requires_grad = False

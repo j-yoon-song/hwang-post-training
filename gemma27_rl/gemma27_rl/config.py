@@ -18,6 +18,8 @@ class ModelConfig:
     attn_implementation: str | None = "auto"
     use_fast_tokenizer: bool = True
     reference_device: str | None = None
+    policy_gpu_ids: list[int] = field(default_factory=list)
+    reference_gpu_ids: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -217,6 +219,38 @@ def _resolve_model_name_or_path(value: str | None, base_dir: Path) -> str | None
     return text
 
 
+def _normalize_gpu_ids(raw_ids: list[int], field_name: str) -> list[int]:
+    out: list[int] = []
+    seen: set[int] = set()
+    for idx in raw_ids:
+        try:
+            value = int(idx)
+        except Exception as exc:  # pragma: no cover - defensive
+            raise ValueError(f"{field_name} contains non-integer value: {idx!r}") from exc
+        if value < 0:
+            raise ValueError(f"{field_name} must contain non-negative GPU indices.")
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _parse_cuda_index(device: str | None) -> int | None:
+    if device is None:
+        return None
+    text = str(device).strip().lower()
+    if not text.startswith("cuda"):
+        return None
+    if text == "cuda":
+        return None
+    if text.startswith("cuda:"):
+        suffix = text.split(":", 1)[1].strip()
+        if suffix.isdigit():
+            return int(suffix)
+    return None
+
+
 def _validate_config(cfg: RLPostTrainConfig) -> None:
     use_hf_dataset = bool(cfg.data.hf_dataset_name and str(cfg.data.hf_dataset_name).strip())
     if use_hf_dataset:
@@ -243,6 +277,35 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("reward.span_combine_policy must be sum|min|max")
     if not cfg.reward.metricx.enabled and not cfg.reward.xcomet.enabled:
         raise ValueError("At least one reward model must be enabled.")
+
+    cfg.model.policy_gpu_ids = _normalize_gpu_ids(cfg.model.policy_gpu_ids, "model.policy_gpu_ids")
+    cfg.model.reference_gpu_ids = _normalize_gpu_ids(cfg.model.reference_gpu_ids, "model.reference_gpu_ids")
+
+    policy_set = set(cfg.model.policy_gpu_ids)
+    ref_set = set(cfg.model.reference_gpu_ids)
+    overlap = sorted(policy_set & ref_set)
+    if overlap:
+        raise ValueError(
+            "model.policy_gpu_ids and model.reference_gpu_ids must be disjoint. "
+            f"overlap={overlap}"
+        )
+
+    reserved = set(policy_set) | set(ref_set)
+    metricx_idx = _parse_cuda_index(cfg.reward.metricx.device if cfg.reward.metricx.enabled else None)
+    xcomet_idx = _parse_cuda_index(cfg.reward.xcomet.device if cfg.reward.xcomet.enabled else None)
+
+    if metricx_idx is not None and metricx_idx in reserved:
+        raise ValueError(
+            "reward.metricx.device overlaps policy/reference GPU allocation. "
+            f"metricx_gpu={metricx_idx} reserved={sorted(reserved)}"
+        )
+    if xcomet_idx is not None and xcomet_idx in reserved:
+        raise ValueError(
+            "reward.xcomet.device overlaps policy/reference GPU allocation. "
+            f"xcomet_gpu={xcomet_idx} reserved={sorted(reserved)}"
+        )
+    if metricx_idx is not None and xcomet_idx is not None and metricx_idx == xcomet_idx:
+        raise ValueError("reward.metricx.device and reward.xcomet.device must be different GPUs.")
 
 
 def load_config(path: str | Path) -> RLPostTrainConfig:

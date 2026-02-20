@@ -29,6 +29,8 @@ WMT24pp 빠른 테스트 예시: `configs/train_wmt24pp_enko_toy.yaml`
 
 핵심값:
 - `model.policy_name_or_path`: SFT 결과 체크포인트 경로
+- `model.policy_gpu_ids`: policy 모델에 할당할 GPU 인덱스 목록 (예: `[0,1,2]`)
+- `model.reference_gpu_ids`: reference 모델에 할당할 GPU 인덱스 목록 (예: `[3,4,5]`)
 - `data.train_file`: RL 학습용 JSONL/JSON/Parquet
 - 또는 `data.hf_dataset_name` + `data.hf_dataset_config_name` + `data.hf_train_split`
 - `generation.num_samples_per_prompt`: GRPO group 크기
@@ -45,6 +47,12 @@ GPU 배치(자동):
 - GPU 개수가 부족하면 가능한 범위에서 배정하고 경고 로그를 출력합니다.
 - `xcomet`은 Lightning `Trainer` 재생성을 피하고 모델을 메모리에 상주시켜,
   반복 스코어링 시 초기화 오버헤드를 줄입니다.
+
+GPU 배치(명시적 8-GPU 분할):
+- `model.policy_gpu_ids`/`model.reference_gpu_ids`를 설정하면 자동 배치보다 우선합니다.
+- 이 경우 policy/reference는 지정한 GPU 목록에 `device_map=auto`로 로드됩니다.
+- MetricX/XCOMET은 `reward.metricx.device`, `reward.xcomet.device`로 단일 GPU를 직접 지정하세요.
+- 예시(3/3/1/1): `policy=[0,1,2]`, `reference=[3,4,5]`, `metricx=cuda:6`, `xcomet=cuda:7`.
 
 토큰 사용 권장 방식:
 
