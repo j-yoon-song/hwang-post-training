@@ -251,15 +251,6 @@ def _common_prefix_len(left: list[int], right: list[int]) -> int:
     return i
 
 
-def _common_suffix_len(left: list[int], right: list[int], left_stop: int, right_stop: int) -> int:
-    i = 0
-    while left_stop - i - 1 >= 0 and right_stop - i - 1 >= 0:
-        if left[left_stop - i - 1] != right[right_stop - i - 1]:
-            break
-        i += 1
-    return i
-
-
 def _extract_template_target_span(
     tokenizer: PreTrainedTokenizerBase,
     prompt_messages: list[dict[str, str]],
@@ -271,6 +262,13 @@ def _extract_template_target_span(
 
     full_with_target = prompt_messages + [{"role": "assistant", "content": target_text}]
     full_with_empty = prompt_messages + [{"role": "assistant", "content": ""}]
+    prompt_with_generation = _apply_chat_template(
+        tokenizer=tokenizer,
+        messages=prompt_messages,
+        add_generation_prompt=True,
+        max_seq_length=max_seq_length,
+        truncate=False,
+    )
 
     target_ids_full = _apply_chat_template(
         tokenizer=tokenizer,
@@ -289,18 +287,15 @@ def _extract_template_target_span(
     if not target_ids_full:
         return None
 
+    # Prefer direct generation-prefix split: [prompt+generation_prefix] + [assistant_text + turn suffix]
+    prefix_from_generation = _common_prefix_len(prompt_with_generation, target_ids_full)
+    if prefix_from_generation == len(prompt_with_generation):
+        target_span = target_ids_full[prefix_from_generation:]
+        if target_span:
+            return prompt_with_generation, target_span
+
     prefix_len = _common_prefix_len(empty_ids_full, target_ids_full)
-    suffix_len = _common_suffix_len(
-        empty_ids_full,
-        target_ids_full,
-        left_stop=len(empty_ids_full),
-        right_stop=len(target_ids_full),
-    )
-    # Prevent over-trimming when target text happens to share tail tokens.
-    max_wrapper_suffix = max(0, len(empty_ids_full) - prefix_len)
-    suffix_len = min(suffix_len, max_wrapper_suffix)
-    target_end = max(prefix_len, len(target_ids_full) - suffix_len)
-    target_span = target_ids_full[prefix_len:target_end]
+    target_span = target_ids_full[prefix_len:]
     if not target_span:
         return None
     prompt_prefix = target_ids_full[:prefix_len]
@@ -311,6 +306,9 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
     data_cfg = cfg.data
     max_len = cfg.train.max_seq_length
     eos_token_id = tokenizer.eos_token_id
+    eot_token_id = tokenizer.convert_tokens_to_ids("<end_of_turn>")
+    if eot_token_id is None or eot_token_id == tokenizer.unk_token_id:
+        eot_token_id = None
 
     def _tokenize(example: dict[str, Any]) -> dict[str, Any]:
         source_text_original = str(example[data_cfg.source_field])
@@ -321,6 +319,8 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
         full_ids: list[int] = []
         labels: list[int] = []
         non_ignored = 0
+        use_template_target = False
+        template_target_ends_with_eot = False
 
         target_ids_fallback = list(
             tokenizer(
@@ -355,6 +355,10 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
                 if template_target_ids:
                     prompt_ids_raw = template_prompt_ids
                     target_ids_effective = template_target_ids
+                    use_template_target = True
+                    template_target_ends_with_eot = bool(
+                        eot_token_id is not None and template_target_ids[-1] == eot_token_id
+                    )
 
             if not has_target:
                 prompt_ids = prompt_ids_raw[:max_len]
@@ -370,7 +374,17 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
                     target_budget = max(0, max_len - len(prompt_ids))
                     target_ids = target_ids_effective[:target_budget]
 
-                if eos_token_id is not None and (not target_ids or target_ids[-1] != eos_token_id):
+                if use_template_target and template_target_ends_with_eot and eot_token_id is not None:
+                    if not target_ids:
+                        if prompt_ids:
+                            prompt_ids = prompt_ids[:-1]
+                            target_ids = [int(eot_token_id)]
+                    elif target_ids[-1] != eot_token_id:
+                        if len(prompt_ids) + len(target_ids) < max_len:
+                            target_ids.append(int(eot_token_id))
+                        else:
+                            target_ids[-1] = int(eot_token_id)
+                elif eos_token_id is not None and (not target_ids or target_ids[-1] != eos_token_id):
                     if len(prompt_ids) + len(target_ids) < max_len:
                         target_ids.append(int(eos_token_id))
                     elif target_ids:
