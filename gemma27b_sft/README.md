@@ -21,6 +21,8 @@ uv pip install -e .
 Training preprocessing uses Hugging Face `datasets`
 (`>=2.21.0,<5.0.0`; supports 4.x).
 When using `datasets` 4.x, use `pyarrow>=21.0.0`.
+Gemma 3 training/serving compatibility requires
+`transformers>=4.50.0,<5.0.0`.
 
 ## 2) Prepare Data
 
@@ -176,6 +178,7 @@ Also writes:
 - `resolved_config.yaml`
 - Hugging Face checkpoints (`checkpoint-*`)
 - Final model + tokenizer on `trainer.save_model()`
+- Processor artifacts (`preprocessor_config.json`, `processor_config.json`) for vLLM/serving compatibility
 
 ## 8) If You Still See CUDA OOM
 
@@ -187,3 +190,26 @@ Check these first:
   - `train.max_seq_length=1024`
 - Keep `per_device_train_batch_size=1` for 27B full SFT.
 - If you need faster recovery from OOM/debug instability, lower `global_batch_size` (for example `16`).
+
+## 9) vLLM Error: `GemmaTokenizerFast has no attribute image_token_id`
+
+This is usually an environment mismatch (older `transformers` in the serving env).
+
+Fix on the serving server:
+
+```bash
+pip install -U "transformers>=4.50.0,<5.0.0" "tokenizers>=0.21.0"
+```
+
+Then verify:
+
+```bash
+python - <<'PY'
+from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained("/path/to/your/sft_model_dir", use_fast=True)
+print("has image_token_id:", hasattr(tok, "image_token_id"))
+print("image_token_id:", getattr(tok, "image_token_id", None))
+PY
+```
+
+Expected: `has image_token_id: True`.

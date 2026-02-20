@@ -310,6 +310,7 @@ def _extract_template_target_span(
 def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
     data_cfg = cfg.data
     max_len = cfg.train.max_seq_length
+    eos_token_id = tokenizer.eos_token_id
 
     def _tokenize(example: dict[str, Any]) -> dict[str, Any]:
         source_text_original = str(example[data_cfg.source_field])
@@ -361,13 +362,22 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
             else:
                 if len(prompt_ids_raw) + len(target_ids_effective) <= max_len:
                     prompt_ids = prompt_ids_raw
-                    target_ids = target_ids_effective
+                    target_ids = list(target_ids_effective)
                 else:
                     target_reserve = min(len(target_ids_effective), max(32, max_len // 8))
                     prompt_budget = max(0, max_len - target_reserve)
                     prompt_ids = prompt_ids_raw[:prompt_budget]
                     target_budget = max(0, max_len - len(prompt_ids))
                     target_ids = target_ids_effective[:target_budget]
+
+                if eos_token_id is not None and (not target_ids or target_ids[-1] != eos_token_id):
+                    if len(prompt_ids) + len(target_ids) < max_len:
+                        target_ids.append(int(eos_token_id))
+                    elif target_ids:
+                        target_ids[-1] = int(eos_token_id)
+                    elif prompt_ids:
+                        prompt_ids = prompt_ids[:-1]
+                        target_ids = [int(eos_token_id)]
 
             full_ids = prompt_ids + target_ids
             labels = ([-100] * len(prompt_ids)) + target_ids

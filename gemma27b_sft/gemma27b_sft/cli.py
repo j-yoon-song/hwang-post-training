@@ -11,9 +11,10 @@ from pathlib import Path
 import torch
 from transformers import (
     AutoModelForCausalLM,
+    AutoProcessor,
     AutoTokenizer,
     Adafactor,
-    DataCollatorForLanguageModeling,
+    DataCollatorForSeq2Seq,
     Trainer,
     TrainingArguments,
 )
@@ -143,6 +144,97 @@ def _apply_runtime_compat_overrides(cfg: SFTConfig) -> None:
         cfg.train.fsdp_activation_checkpointing = False
         if not cfg.train.gradient_checkpointing:
             cfg.train.gradient_checkpointing = True
+
+
+def _is_gemma3_model_name(model_name: str) -> bool:
+    lowered = model_name.lower()
+    return "gemma-3" in lowered or "gemma3" in lowered
+
+
+def _ensure_gemma3_tokenizer_attrs(tokenizer) -> bool:
+    init_kwargs = getattr(tokenizer, "init_kwargs", {})
+    extra = dict(getattr(tokenizer, "extra_special_tokens", {}) or {})
+    extra.update(dict(init_kwargs.get("extra_special_tokens") or {}))
+
+    boi_token = (
+        getattr(tokenizer, "boi_token", None)
+        or extra.get("boi_token")
+        or init_kwargs.get("boi_token")
+        or "<start_of_image>"
+    )
+    eoi_token = (
+        getattr(tokenizer, "eoi_token", None)
+        or extra.get("eoi_token")
+        or init_kwargs.get("eoi_token")
+        or "<end_of_image>"
+    )
+    image_token = (
+        getattr(tokenizer, "image_token", None)
+        or extra.get("image_token")
+        or init_kwargs.get("image_token")
+        or "<image_soft_token>"
+    )
+
+    image_token_id = tokenizer.convert_tokens_to_ids(image_token)
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    if image_token_id is None or image_token_id == unk_id:
+        return False
+
+    setattr(tokenizer, "boi_token", boi_token)
+    setattr(tokenizer, "eoi_token", eoi_token)
+    setattr(tokenizer, "image_token", image_token)
+    setattr(tokenizer, "image_token_id", int(image_token_id))
+
+    extra.update(
+        {
+            "boi_token": boi_token,
+            "eoi_token": eoi_token,
+            "image_token": image_token,
+        }
+    )
+    if isinstance(init_kwargs, dict):
+        init_kwargs["boi_token"] = boi_token
+        init_kwargs["eoi_token"] = eoi_token
+        init_kwargs["image_token"] = image_token
+        init_kwargs["extra_special_tokens"] = extra
+        init_kwargs["processor_class"] = init_kwargs.get("processor_class") or "Gemma3Processor"
+
+    return True
+
+
+def _save_processor_artifacts(cfg: SFTConfig, tokenizer) -> None:
+    if _is_gemma3_model_name(cfg.model.name_or_path):
+        has_image_token_id = hasattr(tokenizer, "image_token_id")
+        if not has_image_token_id:
+            has_image_token_id = _ensure_gemma3_tokenizer_attrs(tokenizer)
+        if not has_image_token_id:
+            logger.warning(
+                "Gemma3 tokenizer is missing image_token_id. "
+                "Upgrade transformers (recommended >=4.50.0) in training/serving env."
+            )
+
+    try:
+        processor = AutoProcessor.from_pretrained(
+            cfg.model.name_or_path,
+            trust_remote_code=cfg.model.trust_remote_code,
+        )
+        processor.save_pretrained(cfg.train.output_dir)
+        return
+    except Exception as exc:
+        if not _is_gemma3_model_name(cfg.model.name_or_path):
+            raise RuntimeError(str(exc)) from exc
+        logger.warning("AutoProcessor save failed for Gemma3, trying Gemma3Processor fallback: %s", exc)
+
+    from transformers import AutoImageProcessor
+    from transformers.models.gemma3.processing_gemma3 import Gemma3Processor
+
+    _ensure_gemma3_tokenizer_attrs(tokenizer)
+    image_processor = AutoImageProcessor.from_pretrained(
+        cfg.model.name_or_path,
+        trust_remote_code=cfg.model.trust_remote_code,
+    )
+    processor = Gemma3Processor(image_processor=image_processor, tokenizer=tokenizer)
+    processor.save_pretrained(cfg.train.output_dir)
 
 
 def _load_model(cfg: SFTConfig):
@@ -362,7 +454,23 @@ def run(cfg: SFTConfig) -> None:
     _validate_launch(cfg)
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.name_or_path, use_fast=True)
-    tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        logger.warning(
+            "Tokenizer has no pad_token; falling back to eos_token as pad_token. "
+            "This may reduce EOS supervision quality."
+        )
+    if _is_gemma3_model_name(cfg.model.name_or_path) and not hasattr(tokenizer, "image_token_id"):
+        if _ensure_gemma3_tokenizer_attrs(tokenizer):
+            logger.warning(
+                "Gemma3 tokenizer loaded without image_token_id, but it was recovered from special tokens. "
+                "Serving env should use transformers>=4.50.0."
+            )
+        else:
+            logger.warning(
+                "Gemma3 tokenizer loaded without image_token_id and recovery failed. "
+                "Upgrade transformers in this environment (recommended >=4.50.0)."
+            )
 
     train_ds, eval_ds = build_datasets(cfg, tokenizer)
     if len(train_ds) == 0:
@@ -371,6 +479,8 @@ def run(cfg: SFTConfig) -> None:
 
     model = _load_model(cfg)
     model.config.pad_token_id = tokenizer.pad_token_id
+    if tokenizer.eos_token_id is not None:
+        model.config.eos_token_id = tokenizer.eos_token_id
     use_fsdp_activation_ckpt = bool(cfg.train.fsdp and cfg.train.fsdp_activation_checkpointing)
     use_hf_gradient_ckpt = bool(cfg.train.gradient_checkpointing)
     if use_hf_gradient_ckpt and use_fsdp_activation_ckpt:
@@ -411,9 +521,10 @@ def run(cfg: SFTConfig) -> None:
         has_eval=eval_ds is not None,
         hf_gradient_checkpointing=use_hf_gradient_ckpt,
     )
-    collator = DataCollatorForLanguageModeling(
+    collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer,
-        mlm=False,
+        label_pad_token_id=-100,
+        padding=True,
         pad_to_multiple_of=8,
         return_tensors="pt",
     )
@@ -429,6 +540,16 @@ def run(cfg: SFTConfig) -> None:
     trainer.train(resume_from_checkpoint=cfg.train.resume_from_checkpoint)
     trainer.save_model()
     tokenizer.save_pretrained(cfg.train.output_dir)
+    try:
+        # Gemma 3 + vLLM path can require processor artifacts
+        # (e.g., preprocessor_config.json) even for text-centric runs.
+        _save_processor_artifacts(cfg, tokenizer)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning(
+            "Failed to save processor artifacts to output_dir=%s: %s",
+            cfg.train.output_dir,
+            exc,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
