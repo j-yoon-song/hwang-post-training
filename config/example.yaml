@@ -113,3 +113,13 @@ filters:
     temperature: 0.0
     max_tokens: 128
     fail_policy: conservative
+    round_trip:
+      enabled: false
+      model:
+      back_translation_max_tokens: 512
+      back_translation_temperature: 0.0
+      back_translation_top_p: 1.0
+      judge_max_tokens: 192
+      judge_temperature: 0.0
+      judge_top_p: 1.0
+      min_semantic_similarity: 0.8

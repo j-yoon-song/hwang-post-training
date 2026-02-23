@@ -16,7 +16,7 @@ from datasets import load_dataset
 from .bucketing import BalancedBucketSampler, assign_bucket
 from .caches import StageProgressStore
 from .config import PipelineConfig, dump_config, resolve_metricx_cache_path
-from .filters import apply_llm_judge_filter, apply_rule_based_filters
+from .filters import apply_llm_judge_filter, apply_round_trip_semantic_filter, apply_rule_based_filters
 from .io_utils import ensure_dir, read_jsonl, write_jsonl
 from .metricx import MetricXScorer
 from .prompts import build_translation_messages
@@ -67,6 +67,8 @@ class PipelineRunner:
             "filtered": self.out_dir / "filtered.jsonl",
             "rejected": self.out_dir / "rejected.jsonl",
             "final": self.out_dir / "final_dataset.jsonl",
+            "final_round_trip": self.out_dir / "final_dataset_round_trip.jsonl",
+            "final_round_trip_rejected": self.out_dir / "final_dataset_round_trip_rejected.jsonl",
             "topk": self.out_dir / "final_candidates_topk.jsonl",
         }
 
@@ -877,6 +879,24 @@ class PipelineRunner:
         if current_source is not None and current_rows:
             yield current_source, current_rows
 
+    @staticmethod
+    def _filter_payload(
+        passed: bool,
+        reason_code: str,
+        notes: str,
+        filter_type: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "passed": bool(passed),
+            "reason_code": str(reason_code),
+            "notes": str(notes),
+            "type": str(filter_type),
+        }
+        if metadata:
+            payload["metadata"] = metadata
+        return payload
+
     def stage_format_filter(self) -> None:
         in_path = self.paths["scored_best"]
         out_path = self.paths["filtered"]
@@ -908,12 +928,13 @@ class PipelineRunner:
                 reject_buffer.append(
                     {
                         **row,
-                        "filters": {
-                            "passed": False,
-                            "reason_code": decision.reason_code,
-                            "notes": decision.notes,
-                            "type": "rule_based",
-                        },
+                        "filters": self._filter_payload(
+                            passed=False,
+                            reason_code=decision.reason_code,
+                            notes=decision.notes,
+                            filter_type="rule_based",
+                            metadata=decision.metadata,
+                        ),
                     }
                 )
                 self.stats.inc(f"filter.reject.{decision.reason_code}")
@@ -927,6 +948,7 @@ class PipelineRunner:
                     progress_ids = []
                 continue
 
+            judge_decision = None
             if self.cfg.filters.llm_judge.enabled:
                 judge_decision = apply_llm_judge_filter(
                     teacher=self.teacher,
@@ -941,12 +963,13 @@ class PipelineRunner:
                     reject_buffer.append(
                         {
                             **row,
-                            "filters": {
-                                "passed": False,
-                                "reason_code": judge_decision.reason_code,
-                                "notes": judge_decision.notes,
-                                "type": "llm_judge",
-                            },
+                            "filters": self._filter_payload(
+                                passed=False,
+                                reason_code=judge_decision.reason_code,
+                                notes=judge_decision.notes,
+                                filter_type="llm_judge",
+                                metadata=judge_decision.metadata,
+                            ),
                         }
                     )
                     self.stats.inc(f"filter.reject.{judge_decision.reason_code}")
@@ -963,12 +986,13 @@ class PipelineRunner:
             passed += 1
             out_row = {
                 **row,
-                "filters": {
-                    "passed": True,
-                    "reason_code": "pass",
-                    "notes": "",
-                    "type": "rule_based+llm_judge" if self.cfg.filters.llm_judge.enabled else "rule_based",
-                },
+                "filters": self._filter_payload(
+                    passed=True,
+                    reason_code="pass",
+                    notes="",
+                    filter_type="rule_based+llm_judge" if self.cfg.filters.llm_judge.enabled else "rule_based",
+                    metadata=judge_decision.metadata if judge_decision is not None else None,
+                ),
             }
             pass_buffer.append(out_row)
             self.stats.inc("filter.pass")
@@ -1056,3 +1080,86 @@ class PipelineRunner:
             json.dumps(manifest, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+
+    def stage_round_trip_filter_final(self) -> None:
+        in_path = self.paths["final"]
+        out_path = self.paths["final_round_trip"]
+        reject_path = self.paths["final_round_trip_rejected"]
+        self._maybe_reset_file(out_path)
+        self._maybe_reset_file(reject_path)
+
+        if not in_path.exists():
+            raise FileNotFoundError(f"Input not found: {in_path}")
+        if not self.cfg.filters.llm_judge.round_trip.enabled:
+            raise ValueError(
+                "round_trip_filter_final requires filters.llm_judge.round_trip.enabled=true "
+                "in the config."
+            )
+
+        stage_name = "round_trip_filter_final"
+        passed = 0
+        rejected = 0
+        flush_every = 100
+        pass_buffer: list[dict[str, Any]] = []
+        reject_buffer: list[dict[str, Any]] = []
+        progress_ids: list[str] = []
+
+        for row in read_jsonl(in_path):
+            pair_id = str(row.get("pair_id") or stable_hash(row)[:16])
+            if self.resume and out_path.exists() and self.progress.has(stage_name, pair_id):
+                continue
+            if not self._in_shard(pair_id):
+                continue
+
+            source_lang_name = self.cfg.data.src_lang_name
+            target_code = str(row.get("target_lang_code", self.cfg.data.tgt_lang))
+            target_lang_name = self.cfg.data.tgt_lang_names.get(target_code, self.cfg.data.tgt_lang_name)
+            decision = apply_round_trip_semantic_filter(
+                teacher=self.teacher,
+                source_lang=source_lang_name,
+                target_lang=target_lang_name,
+                source_text=str(row.get("source_text", "")),
+                target_text=str(row.get("target_text", "")),
+                cfg=self.cfg.filters,
+            )
+
+            rt_payload = self._filter_payload(
+                passed=decision.passed,
+                reason_code=decision.reason_code if not decision.passed else "pass",
+                notes=decision.notes,
+                filter_type="round_trip_llm",
+                metadata=decision.metadata,
+            )
+            out_row = {**row, "round_trip_filter": rt_payload}
+            if decision.passed:
+                passed += 1
+                pass_buffer.append(out_row)
+                self.stats.inc("round_trip_filter.pass")
+            else:
+                rejected += 1
+                reject_buffer.append(out_row)
+                self.stats.inc(f"round_trip_filter.reject.{decision.reason_code}")
+
+            progress_ids.append(pair_id)
+            if len(progress_ids) >= flush_every:
+                write_jsonl(out_path, pass_buffer, append=True)
+                pass_buffer = []
+                write_jsonl(reject_path, reject_buffer, append=True)
+                reject_buffer = []
+                self.progress.add_many(stage_name, progress_ids)
+                progress_ids = []
+
+            if (passed + rejected) % 200 == 0:
+                logger.info(
+                    "round_trip_filter_final progress processed=%s pass=%s reject=%s",
+                    passed + rejected,
+                    passed,
+                    rejected,
+                )
+
+        write_jsonl(out_path, pass_buffer, append=True)
+        write_jsonl(reject_path, reject_buffer, append=True)
+        self.progress.add_many(stage_name, progress_ids)
+        logger.info("round_trip_filter_final done pass=%s reject=%s", passed, rejected)
+        self.stats.inc("round_trip_filter.passed", passed)
+        self.stats.inc("round_trip_filter.rejected", rejected)

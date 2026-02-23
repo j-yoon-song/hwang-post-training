@@ -130,12 +130,26 @@ class MetricXConfig:
 
 
 @dataclass
+class RoundTripJudgeConfig:
+    enabled: bool = False
+    model: str | None = None
+    back_translation_max_tokens: int = 512
+    back_translation_temperature: float = 0.0
+    back_translation_top_p: float = 1.0
+    judge_max_tokens: int = 192
+    judge_temperature: float = 0.0
+    judge_top_p: float = 1.0
+    min_semantic_similarity: float = 0.8
+
+
+@dataclass
 class JudgeConfig:
     enabled: bool = True
     model: str = "Qwen/Qwen3-235B-A22B-Instruct-2507"
     temperature: float = 0.0
     max_tokens: int = 128
     fail_policy: str = "conservative"
+    round_trip: RoundTripJudgeConfig = field(default_factory=RoundTripJudgeConfig)
 
 
 @dataclass
@@ -184,6 +198,7 @@ _ALLOWED_STAGES = {
     "score_128_select_best",
     "format_filter",
     "export",
+    "round_trip_filter_final",
     "all",
 }
 
@@ -361,6 +376,21 @@ def load_config(path: str | Path) -> PipelineConfig:
         raise ValueError("teacher.max_concurrency must be > 0")
     if cfg.teacher.sdk_max_retries < 0:
         raise ValueError("teacher.sdk_max_retries must be >= 0")
+    if cfg.filters.llm_judge.fail_policy not in {"conservative", "permissive"}:
+        raise ValueError("filters.llm_judge.fail_policy must be one of {'conservative', 'permissive'}")
+    if cfg.filters.llm_judge.max_tokens <= 0:
+        raise ValueError("filters.llm_judge.max_tokens must be > 0")
+    rt_cfg = cfg.filters.llm_judge.round_trip
+    if rt_cfg.back_translation_max_tokens <= 0:
+        raise ValueError("filters.llm_judge.round_trip.back_translation_max_tokens must be > 0")
+    if rt_cfg.judge_max_tokens <= 0:
+        raise ValueError("filters.llm_judge.round_trip.judge_max_tokens must be > 0")
+    if rt_cfg.back_translation_top_p <= 0.0 or rt_cfg.back_translation_top_p > 1.0:
+        raise ValueError("filters.llm_judge.round_trip.back_translation_top_p must be in (0, 1]")
+    if rt_cfg.judge_top_p <= 0.0 or rt_cfg.judge_top_p > 1.0:
+        raise ValueError("filters.llm_judge.round_trip.judge_top_p must be in (0, 1]")
+    if rt_cfg.min_semantic_similarity < 0.0 or rt_cfg.min_semantic_similarity > 1.0:
+        raise ValueError("filters.llm_judge.round_trip.min_semantic_similarity must be in [0, 1]")
     if cfg.metricx.worker_start_timeout_s <= 0:
         raise ValueError("metricx.worker_start_timeout_s must be > 0")
     if cfg.metricx.worker_response_timeout_s <= 0:

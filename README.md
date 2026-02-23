@@ -11,7 +11,7 @@ TranslateGemma 방식(MADLAD-400 -> prefilter 2-sample -> final 128-sample -> Me
 ## 1. 핵심 기능
 
 - stage 기반 실행
-- `sample_sources`, `prefilter_score`, `select_sources`, `generate_128`, `score_select_best`, `format_filter`, `export`
+- `sample_sources`, `prefilter_score`, `select_sources`, `generate_128`, `score_select_best`, `format_filter`, `export`, `round_trip_filter_final`
 - 재개(resume)
 - `progress.sqlite`로 처리 완료 item 추적
 - 캐시
@@ -30,6 +30,7 @@ TranslateGemma 방식(MADLAD-400 -> prefilter 2-sample -> final 128-sample -> Me
 - `synth_parallel/segmentation.py`: 문서 -> 세그먼트/blob
 - `synth_parallel/bucketing.py`: 길이 버킷 샘플러
 - `synth_parallel/filters.py`: rule-based + optional LLM judge
+- `round_trip_filter_final`: `final_dataset.jsonl`에 라운드트립(역번역+의미유사) 필터 적용
 - `config/example.yaml`: 실행 설정 예시
 
 ## 3. 사전 준비
@@ -154,6 +155,7 @@ source .venv/bin/activate
 - `metricx.device`
 - `cuda:0` 권장 (H100 1장 고정)
 - 멀티프로세스에서 `CUDA_VISIBLE_DEVICES`로 GPU를 프로세스별로 분리할 때도 `metricx.device`는 보통 `cuda:0`로 두고, 런처의 `CUDA_VISIBLE_DEVICES`를 우선 사용
+- `metricx.device: cuda:1`처럼 전역 GPU id를 주더라도, `CUDA_VISIBLE_DEVICES`가 설정되어 있으면 MetricX worker에서 로컬 인덱스로 자동 매핑
 - `metricx.python_bin`
 - MetricX 전용 env의 Python 경로
 - 예: `../.venv-metricx/bin/python` (`config/example.yaml` 기준)
@@ -166,6 +168,11 @@ source .venv/bin/activate
 - MetricX-24 기본 1536 권장(레포 README 예시)
 - `metricx.batch_size`
 - 파이프라인 정책상 **항상 1로 강제**됨(설정값을 넣어도 실행 시 1 사용)
+- `filters.llm_judge.round_trip`
+- `enabled: true`면 LLM judge를 라운드트립 모드로 수행
+- 1) `target_text`를 `target_lang -> source_lang`으로 역번역
+- 2) `source_text` vs `back_translation` 의미 유사도(JSON) 판정
+- `min_semantic_similarity` 미만이면 reject
 
 예시(중요 부분):
 
@@ -282,6 +289,7 @@ python -m synth_parallel.cli run --config config/example.yaml --stage generate_1
 python -m synth_parallel.cli run --config config/example.yaml --stage score_select_best
 python -m synth_parallel.cli run --config config/example.yaml --stage format_filter
 python -m synth_parallel.cli run --config config/example.yaml --stage export
+python -m synth_parallel.cli run --config config/example.yaml --stage round_trip_filter_final
 ```
 
 ### 7.4 공통 옵션
@@ -304,6 +312,8 @@ python -m synth_parallel.cli run --config config/example.yaml --stage export
 - `filtered.jsonl`
 - `rejected.jsonl`
 - `final_dataset.jsonl` (최종)
+- `final_dataset_round_trip.jsonl` (`round_trip_filter_final` pass)
+- `final_dataset_round_trip_rejected.jsonl` (`round_trip_filter_final` reject)
 - `final_candidates_topk.jsonl`
 - `resolved_config.yaml`
 - `manifest.json`

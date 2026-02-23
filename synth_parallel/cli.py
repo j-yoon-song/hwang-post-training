@@ -27,6 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
             "score_128_select_best",
             "format_filter",
             "export",
+            "round_trip_filter_final",
             "all",
         ],
     )
