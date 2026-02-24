@@ -107,6 +107,28 @@ filters:
     - "<think>"
     - "</think>"
     - "```"
+  source_atomicity:
+    enabled: false
+    min_chars: 20
+    max_chars: 500
+    max_sentences: 2
+    max_newlines: 0
+    max_words: 80
+    min_letter_ratio: 0.55
+    max_digit_ratio: 0.20
+    max_punct_symbol_ratio: 0.35
+    reject_urls: true
+    reject_emails: true
+    reject_html: true
+    reject_bullets: true
+    blocked_substrings:
+      - "cookie policy"
+      - "privacy policy"
+      - "all rights reserved"
+      - "click here"
+      - "read more"
+      - "sign up"
+      - "subscribe"
   llm_judge:
     enabled: true
     model: Qwen/Qwen3-235B-A22B-Instruct-2507

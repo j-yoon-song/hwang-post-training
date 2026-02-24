@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 
-from .config import FiltersConfig
+from .config import FiltersConfig, SourceAtomicityConfig
 from .prompts import (
     build_judge_messages,
     build_round_trip_backtranslate_messages,
@@ -12,6 +14,13 @@ from .prompts import (
 )
 from .teacher import TeacherClient
 from .utils import jaccard_overlap
+
+
+_URL_RE = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
+_EMAIL_RE = re.compile(r"(?i)\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
+_HTML_RE = re.compile(r"(?is)<\s*[a-z!/][^>]*>")
+_BULLET_LINE_RE = re.compile(r"(?m)^\s*(?:[-*•]|[0-9]+[.)])\s+\S+")
+_SENTENCE_SPLIT_RE = re.compile(r"\n+|(?<=[.!?。！？])\s+")
 
 
 @dataclass
@@ -23,6 +32,11 @@ class FilterDecision:
 
 
 def apply_rule_based_filters(source_text: str, target_text: str, cfg: FiltersConfig) -> FilterDecision:
+    if cfg.source_atomicity.enabled:
+        source_decision = _apply_source_atomicity_filter(source_text, cfg.source_atomicity)
+        if not source_decision.passed:
+            return source_decision
+
     cleaned = target_text.strip()
     if not cleaned:
         return FilterDecision(False, "empty")
@@ -49,6 +63,95 @@ def apply_rule_based_filters(source_text: str, target_text: str, cfg: FiltersCon
         return FilterDecision(False, "copy_overlap", notes=f"overlap={overlap:.3f}")
 
     return FilterDecision(True, "pass")
+
+
+def _apply_source_atomicity_filter(source_text: str, cfg: SourceAtomicityConfig) -> FilterDecision:
+    text = source_text.strip()
+    if not text:
+        return FilterDecision(False, "source_empty")
+
+    if len(text) < cfg.min_chars:
+        return FilterDecision(False, "source_too_short", notes=f"chars={len(text)}")
+    if len(text) > cfg.max_chars:
+        return FilterDecision(False, "source_too_long", notes=f"chars={len(text)}")
+
+    newline_count = text.count("\n")
+    if newline_count > cfg.max_newlines:
+        return FilterDecision(False, "source_multiline", notes=f"newlines={newline_count}")
+
+    sentence_count = _approx_sentence_count(text)
+    if sentence_count > cfg.max_sentences:
+        return FilterDecision(
+            False,
+            "source_non_atomic",
+            notes=f"sentences={sentence_count}",
+        )
+
+    word_count = len(text.split())
+    if word_count > cfg.max_words:
+        return FilterDecision(False, "source_too_many_words", notes=f"words={word_count}")
+
+    lowered = text.lower()
+    for token in cfg.blocked_substrings:
+        token_norm = str(token).strip().lower()
+        if token_norm and token_norm in lowered:
+            return FilterDecision(False, "source_blocked_substring", notes=token_norm)
+
+    if cfg.reject_urls and _URL_RE.search(text):
+        return FilterDecision(False, "source_contains_url")
+    if cfg.reject_emails and _EMAIL_RE.search(text):
+        return FilterDecision(False, "source_contains_email")
+    if cfg.reject_html and _HTML_RE.search(text):
+        return FilterDecision(False, "source_contains_html")
+    if cfg.reject_bullets and _BULLET_LINE_RE.search(text):
+        return FilterDecision(False, "source_list_like")
+
+    ratios = _text_char_ratios(text)
+    letter_ratio = ratios["letter_ratio"]
+    digit_ratio = ratios["digit_ratio"]
+    punct_symbol_ratio = ratios["punct_symbol_ratio"]
+
+    if letter_ratio < cfg.min_letter_ratio:
+        return FilterDecision(False, "source_low_letter_ratio", notes=f"letter_ratio={letter_ratio:.3f}")
+    if digit_ratio > cfg.max_digit_ratio:
+        return FilterDecision(False, "source_high_digit_ratio", notes=f"digit_ratio={digit_ratio:.3f}")
+    if punct_symbol_ratio > cfg.max_punct_symbol_ratio:
+        return FilterDecision(
+            False,
+            "source_high_punct_symbol_ratio",
+            notes=f"punct_symbol_ratio={punct_symbol_ratio:.3f}",
+        )
+
+    return FilterDecision(True, "pass")
+
+
+def _approx_sentence_count(text: str) -> int:
+    stripped = text.strip()
+    if not stripped:
+        return 0
+    chunks = [part.strip() for part in _SENTENCE_SPLIT_RE.split(stripped) if part.strip()]
+    return max(1, len(chunks))
+
+
+def _text_char_ratios(text: str) -> dict[str, float]:
+    visible_chars = [ch for ch in text if not ch.isspace()]
+    if not visible_chars:
+        return {"letter_ratio": 0.0, "digit_ratio": 0.0, "punct_symbol_ratio": 0.0}
+
+    visible_count = len(visible_chars)
+    letter_count = sum(1 for ch in visible_chars if ch.isalpha())
+    digit_count = sum(1 for ch in visible_chars if ch.isdigit())
+    punct_symbol_count = 0
+    for ch in visible_chars:
+        cat = unicodedata.category(ch)
+        if cat and cat[0] in {"P", "S"}:
+            punct_symbol_count += 1
+
+    return {
+        "letter_ratio": letter_count / visible_count,
+        "digit_ratio": digit_count / visible_count,
+        "punct_symbol_ratio": punct_symbol_count / visible_count,
+    }
 
 
 def apply_llm_judge_filter(

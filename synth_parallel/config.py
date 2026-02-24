@@ -143,6 +143,34 @@ class RoundTripJudgeConfig:
 
 
 @dataclass
+class SourceAtomicityConfig:
+    enabled: bool = False
+    min_chars: int = 20
+    max_chars: int = 500
+    max_sentences: int = 2
+    max_newlines: int = 0
+    max_words: int = 80
+    min_letter_ratio: float = 0.55
+    max_digit_ratio: float = 0.20
+    max_punct_symbol_ratio: float = 0.35
+    reject_urls: bool = True
+    reject_emails: bool = True
+    reject_html: bool = True
+    reject_bullets: bool = True
+    blocked_substrings: list[str] = field(
+        default_factory=lambda: [
+            "cookie policy",
+            "privacy policy",
+            "all rights reserved",
+            "click here",
+            "read more",
+            "sign up",
+            "subscribe",
+        ]
+    )
+
+
+@dataclass
 class JudgeConfig:
     enabled: bool = True
     model: str = "Qwen/Qwen3-235B-A22B-Instruct-2507"
@@ -173,6 +201,7 @@ class FiltersConfig:
             "```",
         ]
     )
+    source_atomicity: SourceAtomicityConfig = field(default_factory=SourceAtomicityConfig)
     llm_judge: JudgeConfig = field(default_factory=JudgeConfig)
 
 
@@ -391,6 +420,25 @@ def load_config(path: str | Path) -> PipelineConfig:
         raise ValueError("filters.llm_judge.round_trip.judge_top_p must be in (0, 1]")
     if rt_cfg.min_semantic_similarity < 0.0 or rt_cfg.min_semantic_similarity > 1.0:
         raise ValueError("filters.llm_judge.round_trip.min_semantic_similarity must be in [0, 1]")
+    src_atomic_cfg = cfg.filters.source_atomicity
+    if src_atomic_cfg.min_chars < 0:
+        raise ValueError("filters.source_atomicity.min_chars must be >= 0")
+    if src_atomic_cfg.max_chars <= 0:
+        raise ValueError("filters.source_atomicity.max_chars must be > 0")
+    if src_atomic_cfg.max_chars < src_atomic_cfg.min_chars:
+        raise ValueError("filters.source_atomicity.max_chars must be >= min_chars")
+    if src_atomic_cfg.max_sentences <= 0:
+        raise ValueError("filters.source_atomicity.max_sentences must be > 0")
+    if src_atomic_cfg.max_newlines < 0:
+        raise ValueError("filters.source_atomicity.max_newlines must be >= 0")
+    if src_atomic_cfg.max_words <= 0:
+        raise ValueError("filters.source_atomicity.max_words must be > 0")
+    if src_atomic_cfg.min_letter_ratio < 0.0 or src_atomic_cfg.min_letter_ratio > 1.0:
+        raise ValueError("filters.source_atomicity.min_letter_ratio must be in [0, 1]")
+    if src_atomic_cfg.max_digit_ratio < 0.0 or src_atomic_cfg.max_digit_ratio > 1.0:
+        raise ValueError("filters.source_atomicity.max_digit_ratio must be in [0, 1]")
+    if src_atomic_cfg.max_punct_symbol_ratio < 0.0 or src_atomic_cfg.max_punct_symbol_ratio > 1.0:
+        raise ValueError("filters.source_atomicity.max_punct_symbol_ratio must be in [0, 1]")
     if cfg.metricx.worker_start_timeout_s <= 0:
         raise ValueError("metricx.worker_start_timeout_s must be > 0")
     if cfg.metricx.worker_response_timeout_s <= 0:

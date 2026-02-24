@@ -24,6 +24,43 @@ def test_rule_based_reject_length_ratio():
     assert decision.reason_code == "ratio_too_small"
 
 
+def test_source_atomicity_rejects_non_atomic_source():
+    cfg = FiltersConfig()
+    cfg.source_atomicity.enabled = True
+    cfg.source_atomicity.max_sentences = 1
+    decision = apply_rule_based_filters(
+        "This is sentence one. This is sentence two.",
+        "이것은 문장 하나입니다. 이것은 문장 둘입니다.",
+        cfg,
+    )
+    assert not decision.passed
+    assert decision.reason_code == "source_non_atomic"
+
+
+def test_source_atomicity_rejects_url_source():
+    cfg = FiltersConfig()
+    cfg.source_atomicity.enabled = True
+    decision = apply_rule_based_filters(
+        "Visit https://example.com/news to verify the claim in this article.",
+        "자세한 내용과 업데이트는 링크를 참고하세요.",
+        cfg,
+    )
+    assert not decision.passed
+    assert decision.reason_code == "source_contains_url"
+
+
+def test_source_atomicity_passes_clean_single_sentence():
+    cfg = FiltersConfig()
+    cfg.source_atomicity.enabled = True
+    decision = apply_rule_based_filters(
+        "The committee approved the proposal after a brief discussion.",
+        "위원회는 짧은 논의 후 제안을 승인했다.",
+        cfg,
+    )
+    assert decision.passed
+    assert decision.reason_code == "pass"
+
+
 def test_llm_judge_uses_sampling_hyperparameters():
     class _FakeTeacher:
         def __init__(self):
