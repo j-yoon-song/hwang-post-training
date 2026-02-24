@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+import math
 import importlib.util
 import inspect
 import logging
@@ -67,19 +68,36 @@ def _setup_logging() -> None:
     )
 
 
-def _freeze_embeddings(model: AutoModelForCausalLM, freeze_output_embeddings: bool) -> tuple[int, int]:
+def _freeze_embeddings(
+    model: AutoModelForCausalLM,
+    freeze_input_embeddings: bool,
+    freeze_output_embeddings: bool,
+) -> tuple[int, int]:
     frozen_params = 0
     input_embeddings = model.get_input_embeddings()
-    if input_embeddings is not None:
+    if freeze_input_embeddings and input_embeddings is not None:
         for param in input_embeddings.parameters():
             param.requires_grad = False
             frozen_params += param.numel()
 
     output_embeddings = model.get_output_embeddings()
-    if freeze_output_embeddings and output_embeddings is not None and output_embeddings is not input_embeddings:
-        for param in output_embeddings.parameters():
-            param.requires_grad = False
-            frozen_params += param.numel()
+    if freeze_output_embeddings and output_embeddings is not None:
+        if output_embeddings is input_embeddings:
+            # Tied embeddings share one parameter set. If output freeze is requested,
+            # freezing input is required as well.
+            if not freeze_input_embeddings:
+                logger.warning(
+                    "Output embeddings are tied to input embeddings. "
+                    "freezing output embeddings also freezes input embeddings."
+                )
+                for param in output_embeddings.parameters():
+                    if param.requires_grad:
+                        param.requires_grad = False
+                        frozen_params += param.numel()
+        else:
+            for param in output_embeddings.parameters():
+                param.requires_grad = False
+                frozen_params += param.numel()
 
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -446,6 +464,52 @@ def _validate_launch(cfg: SFTConfig) -> None:
         )
 
 
+def _log_training_sanity(cfg: SFTConfig, train_rows: int) -> None:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    micro_global = cfg.train.per_device_train_batch_size * world_size
+    grad_accum = compute_gradient_accumulation_steps(cfg)
+    effective_global_batch = micro_global * grad_accum
+    if effective_global_batch <= 0:
+        return
+
+    steps_per_epoch = int(math.ceil(float(train_rows) / float(effective_global_batch))) if train_rows > 0 else 0
+    if cfg.train.max_steps is not None and cfg.train.max_steps > 0:
+        total_steps = int(cfg.train.max_steps)
+        total_epochs = (
+            float(total_steps) / float(max(1, steps_per_epoch))
+            if steps_per_epoch > 0
+            else float(cfg.train.num_train_epochs)
+        )
+    else:
+        total_steps = int(math.ceil(float(cfg.train.num_train_epochs) * float(max(1, steps_per_epoch))))
+        total_epochs = float(cfg.train.num_train_epochs)
+
+    logger.info(
+        "Training schedule sanity train_rows=%s effective_global_batch=%s steps_per_epoch=%s total_steps=%s total_epochs=%.3f",
+        train_rows,
+        effective_global_batch,
+        steps_per_epoch,
+        total_steps,
+        total_epochs,
+    )
+    if total_steps < 300:
+        logger.warning(
+            "Total optimization steps look low (%s). This often underfits. "
+            "Consider increasing num_train_epochs or lowering global_batch_size.",
+            total_steps,
+        )
+    if cfg.model.freeze_input_embeddings:
+        logger.warning(
+            "model.freeze_input_embeddings=true. If train-set fit is poor, try false for a sanity overfit run."
+        )
+    if abs(float(cfg.train.learning_rate) - 1e-4) > 1e-12:
+        logger.warning(
+            "Using non-default learning_rate=%s (default recommendation is 1e-4). "
+            "Tune with small train-set overfit checks.",
+            cfg.train.learning_rate,
+        )
+
+
 def run(cfg: SFTConfig) -> None:
     output_dir = Path(cfg.train.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -476,6 +540,7 @@ def run(cfg: SFTConfig) -> None:
     if len(train_ds) == 0:
         raise ValueError("Prepared train dataset is empty. Check data fields/prompt length/max_seq_length.")
     logger.info("Dataset ready train=%s eval=%s", len(train_ds), len(eval_ds) if eval_ds is not None else 0)
+    _log_training_sanity(cfg, len(train_ds))
 
     model = _load_model(cfg)
     model.config.pad_token_id = tokenizer.pad_token_id
@@ -494,7 +559,11 @@ def run(cfg: SFTConfig) -> None:
     if use_hf_gradient_ckpt or use_fsdp_activation_ckpt:
         model.config.use_cache = False
 
-    _freeze_embeddings(model, cfg.model.freeze_output_embeddings)
+    _freeze_embeddings(
+        model,
+        freeze_input_embeddings=cfg.model.freeze_input_embeddings,
+        freeze_output_embeddings=cfg.model.freeze_output_embeddings,
+    )
 
     resolved_layer = _resolve_fsdp_layer_cls_to_wrap(model, cfg)
     if cfg.train.fsdp and "auto_wrap" in str(cfg.train.fsdp) and not resolved_layer:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import hashlib
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -453,6 +454,30 @@ def _dataset_features(cfg: DataConfig) -> Features:
     return Features({field: Value("string") for field in _required_json_fields(cfg)})
 
 
+def _dataset_fingerprint(path: str, cfg: DataConfig) -> str:
+    """
+    Build a stable fingerprint that changes when the source JSONL file content/metadata
+    or relevant loader schema changes. This prevents stale `datasets` generator cache
+    reuse when users overwrite the same file path with new rows.
+    """
+    file_path = Path(path).expanduser().resolve()
+    stat = file_path.stat()
+    payload = {
+        "path": str(file_path),
+        "size": int(stat.st_size),
+        "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9))),
+        "required_fields": _required_json_fields(cfg),
+        "source_field": cfg.source_field,
+        "target_field": cfg.target_field,
+        "source_lang_name_field": cfg.source_lang_name_field,
+        "target_lang_name_field": cfg.target_lang_name_field,
+        "source_lang_code_field": cfg.source_lang_code_field,
+        "target_lang_code_field": cfg.target_lang_code_field,
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
 def _safe_load_json_dataset(path: str, cfg: DataConfig) -> Dataset:
     required_fields = _required_json_fields(cfg)
     stats: dict[str, Any] = {
@@ -512,6 +537,7 @@ def _safe_load_json_dataset(path: str, cfg: DataConfig) -> Dataset:
     ds = Dataset.from_generator(
         _generator,
         features=_dataset_features(cfg),
+        fingerprint=_dataset_fingerprint(path, cfg),
     )
     if stats["bad_json"] > 0:
         logger.warning("Ignored invalid JSON lines=%s while reading %s", stats["bad_json"], path)
@@ -584,6 +610,58 @@ def _summarize_tokenization(dataset: Dataset, max_seq_length: int, sample_limit:
         "source_shrunk_count": source_shrunk_count,
         "max_source_shrink_steps": max_source_shrink_steps,
     }
+
+
+def _warn_tokenization_risks(split_name: str, stats: dict[str, int | float], max_seq_length: int) -> None:
+    sample_size = int(stats.get("sample_size", 0) or 0)
+    if sample_size <= 0:
+        return
+
+    prompt_ge_max = int(stats.get("prompt_ge_max_count", 0) or 0)
+    full_ge_max = int(stats.get("full_ge_max_count", 0) or 0)
+    source_shrunk = int(stats.get("source_shrunk_count", 0) or 0)
+    mean_target = float(stats.get("mean_target_tokens", 0.0) or 0.0)
+
+    prompt_ge_max_ratio = float(prompt_ge_max) / float(sample_size)
+    full_ge_max_ratio = float(full_ge_max) / float(sample_size)
+    source_shrunk_ratio = float(source_shrunk) / float(sample_size)
+
+    if prompt_ge_max_ratio >= 0.20:
+        logger.warning(
+            "%s tokenization risk: %.1f%% prompts reach max_seq_length=%s "
+            "(prompt_ge_max_count=%s/%s). Potential supervision loss from truncation.",
+            split_name,
+            prompt_ge_max_ratio * 100.0,
+            max_seq_length,
+            prompt_ge_max,
+            sample_size,
+        )
+    if full_ge_max_ratio >= 0.30:
+        logger.warning(
+            "%s tokenization risk: %.1f%% full sequences hit max_seq_length=%s "
+            "(full_ge_max_count=%s/%s).",
+            split_name,
+            full_ge_max_ratio * 100.0,
+            max_seq_length,
+            full_ge_max,
+            sample_size,
+        )
+    if source_shrunk_ratio >= 0.05:
+        logger.warning(
+            "%s tokenization risk: source text had to be shrunk in %.1f%% samples "
+            "(source_shrunk_count=%s/%s).",
+            split_name,
+            source_shrunk_ratio * 100.0,
+            source_shrunk,
+            sample_size,
+        )
+    if mean_target < 16.0:
+        logger.warning(
+            "%s tokenization risk: mean_target_tokens is low (%.2f). "
+            "Dataset may provide weak supervision.",
+            split_name,
+            mean_target,
+        )
 
 
 def _raise_empty_train_dataset_error(cfg: SFTConfig, raw_rows: int, token_stats: dict[str, int | float]) -> None:
@@ -813,6 +891,7 @@ def build_datasets(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase) -> tuple[
         train_stats["max_full_tokens"],
         train_stats["mean_target_tokens"],
     )
+    _warn_tokenization_risks("Train", train_stats, cfg.train.max_seq_length)
     train_filtered = train_mapped.filter(
         lambda row: int(row.get("num_target_tokens", 0)) > 0,
         desc="Train filtering non-empty target",
@@ -844,6 +923,7 @@ def build_datasets(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase) -> tuple[
             eval_stats["max_full_tokens"],
             eval_stats["mean_target_tokens"],
         )
+        _warn_tokenization_risks("Eval", eval_stats, cfg.train.max_seq_length)
         eval_filtered = eval_mapped.filter(
             lambda row: int(row.get("num_target_tokens", 0)) > 0,
             desc="Eval filtering non-empty target",

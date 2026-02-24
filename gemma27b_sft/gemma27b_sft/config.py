@@ -24,6 +24,7 @@ class ModelConfig:
     name_or_path: str = "google/gemma-3-27b-it"
     trust_remote_code: bool = False
     attn_implementation: str | None = "auto"
+    freeze_input_embeddings: bool = True
     freeze_output_embeddings: bool = True
 
 
@@ -168,8 +169,8 @@ def load_config(path: str | Path) -> SFTConfig:
         raise FileNotFoundError(f"data.train_file not found: {cfg.data.train_file}")
     if cfg.data.eval_file and not Path(cfg.data.eval_file).exists():
         raise FileNotFoundError(f"data.eval_file not found: {cfg.data.eval_file}")
-    if cfg.train.learning_rate != 1e-4:
-        raise ValueError("This project enforces Adafactor learning_rate=1e-4.")
+    if cfg.train.learning_rate <= 0.0:
+        raise ValueError("train.learning_rate must be > 0.")
     if cfg.train.global_batch_size <= 0:
         raise ValueError("train.global_batch_size must be > 0.")
     if cfg.train.max_seq_length <= 0:

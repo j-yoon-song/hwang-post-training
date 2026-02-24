@@ -6,7 +6,7 @@ This project enforces:
 - Optimizer: `Adafactor`
 - Learning rate: `1e-4`
 - Global batch size: configurable (default config uses `16`)
-- Trainable params: all parameters **except embeddings** (input embeddings frozen, output embeddings optionally frozen)
+- Trainable params: configurable (defaults keep embeddings frozen; can unfreeze for sanity overfit checks)
 
 ## 1) Setup (uv)
 
@@ -131,8 +131,11 @@ CONFIG_PATH=configs/train_8xh100_fsdp.yaml bash scripts/sample_infer.sh
 
 ## 6) Config Notes
 
+- `model.freeze_input_embeddings: true`
+  - Default keeps input embeddings frozen.
+  - If train-set fit is poor, try `false` as a sanity check.
 - `model.freeze_output_embeddings: true`
-  - Keeps output embeddings frozen too (if not tied to input embeddings)
+  - Keeps output embeddings frozen too (if not tied to input embeddings).
 - `train.gradient_checkpointing: true`
   - Recommended default for Gemma 3 FSDP runs in this project.
 - `train.max_seq_length: 1024` (default in provided configs)
@@ -168,6 +171,7 @@ CONFIG_PATH=configs/train_8xh100_fsdp.yaml bash scripts/sample_infer.sh
     `CHAT_TEMPLATE_PROMPT`, and `CHAT_TEMPLATE_FULL`.
     This lets you inspect the exact chat-template-applied text before token IDs are built.
   - Set `data.log_text_max_chars: 0` to disable truncation completely.
+  - CLI also emits tokenization risk warnings when many samples are truncated.
 
 ## 7) Output
 

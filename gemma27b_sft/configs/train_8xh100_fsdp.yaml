@@ -2,6 +2,7 @@ model:
   name_or_path: google/gemma-3-27b-it
   trust_remote_code: false
   attn_implementation: auto
+  freeze_input_embeddings: true
   freeze_output_embeddings: true
 
 data:
