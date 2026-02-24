@@ -8,6 +8,7 @@ import inspect
 import logging
 import os
 from pathlib import Path
+from typing import Any
 
 import torch
 from transformers import (
@@ -15,7 +16,6 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
     Adafactor,
-    DataCollatorForSeq2Seq,
     Trainer,
     TrainingArguments,
 )
@@ -59,6 +59,34 @@ class FixedAdafactorTrainer(Trainer):
                 )
                 return None
             raise
+
+
+class DataCollatorCausalLM:
+    def __init__(self, tokenizer, pad_to_multiple_of: int | None = 8) -> None:
+        self.tokenizer = tokenizer
+        self.pad_to_multiple_of = pad_to_multiple_of
+
+    def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        labels = [feature["labels"] for feature in features]
+        model_features = [{k: v for k, v in feature.items() if k != "labels"} for feature in features]
+        batch = self.tokenizer.pad(
+            model_features,
+            padding=True,
+            return_tensors="pt",
+            pad_to_multiple_of=self.pad_to_multiple_of,
+        )
+        max_len = int(batch["input_ids"].shape[1])
+        padded_labels = torch.full((len(labels), max_len), -100, dtype=torch.long)
+        for i, label in enumerate(labels):
+            label_tensor = torch.tensor(label, dtype=torch.long)
+            if label_tensor.numel() == 0:
+                continue
+            if getattr(self.tokenizer, "padding_side", "right") == "left":
+                padded_labels[i, -label_tensor.numel() :] = label_tensor
+            else:
+                padded_labels[i, : label_tensor.numel()] = label_tensor
+        batch["labels"] = padded_labels
+        return batch
 
 
 def _setup_logging() -> None:
@@ -110,8 +138,52 @@ def _freeze_embeddings(
     return trainable, frozen_params
 
 
+def _freeze_vision_encoder(model: AutoModelForCausalLM) -> int:
+    frozen_params = 0
+    found_module = False
+    attr_candidates = (
+        "vision_tower",
+        "vision_model",
+        "vision_encoder",
+        "vision_backbone",
+    )
+    for attr in attr_candidates:
+        module = getattr(model, attr, None)
+        if module is None or not hasattr(module, "parameters"):
+            continue
+        found_module = True
+        for param in module.parameters():
+            if param.requires_grad:
+                param.requires_grad = False
+                frozen_params += param.numel()
+
+    name_patterns = (
+        "vision_tower",
+        "vision_model",
+        "vision_encoder",
+        "vision_backbone",
+    )
+    for name, param in model.named_parameters():
+        lowered = name.lower()
+        if any(pattern in lowered for pattern in name_patterns):
+            found_module = True
+            if param.requires_grad:
+                param.requires_grad = False
+                frozen_params += param.numel()
+
+    if found_module:
+        logger.info("Vision encoder freeze applied frozen_params=%s", frozen_params)
+    else:
+        logger.info("No vision encoder module detected; skipping vision freeze.")
+    return frozen_params
+
+
 def _is_flash_attn_available() -> bool:
     return torch.cuda.is_available() and importlib.util.find_spec("flash_attn") is not None
+
+
+def _is_deepspeed_available() -> bool:
+    return importlib.util.find_spec("deepspeed") is not None
 
 
 def _resolve_attn_implementation(cfg: SFTConfig) -> str | None:
@@ -240,7 +312,8 @@ def _save_processor_artifacts(cfg: SFTConfig, tokenizer) -> None:
         return
     except Exception as exc:
         if not _is_gemma3_model_name(cfg.model.name_or_path):
-            raise RuntimeError(str(exc)) from exc
+            logger.info("AutoProcessor save skipped for non-Gemma model: %s", exc)
+            return
         logger.warning("AutoProcessor save failed for Gemma3, trying Gemma3Processor fallback: %s", exc)
 
     from transformers import AutoImageProcessor
@@ -289,6 +362,11 @@ def _build_training_arguments(
     output_dir = Path(cfg.train.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     ta_params = set(inspect.signature(TrainingArguments.__init__).parameters)
+    if cfg.train.deepspeed is not None and "deepspeed" not in ta_params:
+        raise RuntimeError(
+            "train.deepspeed is set but this transformers version does not support "
+            "TrainingArguments(deepspeed=...). Upgrade transformers."
+        )
 
     kwargs: dict[str, object] = {
         "output_dir": str(output_dir),
@@ -314,6 +392,8 @@ def _build_training_arguments(
         "remove_unused_columns": False,
         "ddp_find_unused_parameters": cfg.train.ddp_find_unused_parameters,
     }
+    if cfg.train.deepspeed is not None:
+        kwargs["deepspeed"] = cfg.train.deepspeed
     if cfg.train.fsdp:
         kwargs["fsdp"] = cfg.train.fsdp
         kwargs["fsdp_config"] = {
@@ -356,6 +436,8 @@ def _build_training_arguments(
     dropped_kwargs = sorted(set(kwargs) - set(supported_kwargs))
     if dropped_kwargs:
         logger.info("Skipping unsupported TrainingArguments kwargs: %s", ", ".join(dropped_kwargs))
+    if "deepspeed" in supported_kwargs:
+        logger.info("DeepSpeed enabled config=%s", supported_kwargs["deepspeed"])
     if "fsdp" in supported_kwargs:
         logger.info("FSDP enabled mode=%s config=%s", supported_kwargs["fsdp"], supported_kwargs.get("fsdp_config"))
 
@@ -445,11 +527,21 @@ def _build_trainer(
 def _validate_launch(cfg: SFTConfig) -> None:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     cuda_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if cfg.train.deepspeed is not None and not _is_deepspeed_available():
+        raise RuntimeError(
+            "train.deepspeed is set but deepspeed is not installed in this environment. "
+            "Install deepspeed on the training node."
+        )
     if cfg.train.expected_world_size is not None and world_size != cfg.train.expected_world_size:
         logger.warning(
             "WORLD_SIZE mismatch expected=%s actual=%s. This can cause severe throughput/memory issues.",
             cfg.train.expected_world_size,
             world_size,
+        )
+    if cfg.train.deepspeed is not None and world_size <= 1 and cuda_count > 1:
+        raise RuntimeError(
+            "DeepSpeed is enabled but WORLD_SIZE=1. Launch multi-process training.\n"
+            "Example: torchrun --nproc_per_node=8 -m gemma27b_sft.cli --config <config.yaml>"
         )
     if cfg.train.fsdp and world_size <= 1 and cuda_count > 1:
         raise RuntimeError(
@@ -502,6 +594,11 @@ def _log_training_sanity(cfg: SFTConfig, train_rows: int) -> None:
         logger.warning(
             "model.freeze_input_embeddings=true. If train-set fit is poor, try false for a sanity overfit run."
         )
+    if _is_gemma3_model_name(cfg.model.name_or_path) and not cfg.model.freeze_vision_encoder:
+        logger.warning(
+            "model.freeze_vision_encoder=false. For text-only SFT, this often wastes memory "
+            "without quality gains."
+        )
     if abs(float(cfg.train.learning_rate) - 1e-4) > 1e-12:
         logger.warning(
             "Using non-default learning_rate=%s (default recommendation is 1e-4). "
@@ -518,6 +615,7 @@ def run(cfg: SFTConfig) -> None:
     _validate_launch(cfg)
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.name_or_path, use_fast=True)
+    tokenizer.padding_side = "right"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         logger.warning(
@@ -543,6 +641,8 @@ def run(cfg: SFTConfig) -> None:
     _log_training_sanity(cfg, len(train_ds))
 
     model = _load_model(cfg)
+    if cfg.model.freeze_vision_encoder:
+        _freeze_vision_encoder(model)
     model.config.pad_token_id = tokenizer.pad_token_id
     if tokenizer.eos_token_id is not None:
         model.config.eos_token_id = tokenizer.eos_token_id
@@ -590,13 +690,7 @@ def run(cfg: SFTConfig) -> None:
         has_eval=eval_ds is not None,
         hf_gradient_checkpointing=use_hf_gradient_ckpt,
     )
-    collator = DataCollatorForSeq2Seq(
-        tokenizer=tokenizer,
-        label_pad_token_id=-100,
-        padding=True,
-        pad_to_multiple_of=8,
-        return_tensors="pt",
-    )
+    collator = DataCollatorCausalLM(tokenizer=tokenizer, pad_to_multiple_of=8)
 
     trainer = _build_trainer(
         model=model,

@@ -26,6 +26,7 @@ class ModelConfig:
     attn_implementation: str | None = "auto"
     freeze_input_embeddings: bool = True
     freeze_output_embeddings: bool = True
+    freeze_vision_encoder: bool = True
 
 
 @dataclass
@@ -76,6 +77,7 @@ class TrainConfig:
     report_to: list[str] = field(default_factory=list)
     resume_from_checkpoint: str | None = None
     ddp_find_unused_parameters: bool = False
+    deepspeed: str | dict[str, Any] | None = None
     expected_world_size: int | None = None
     fsdp: str | None = None
     fsdp_transformer_layer_cls_to_wrap: str = "auto"
@@ -162,13 +164,21 @@ def load_config(path: str | Path) -> SFTConfig:
     cfg.data.train_file = _resolve_optional_path(cfg.data.train_file, base_dir) or cfg.data.train_file
     cfg.data.eval_file = _resolve_optional_path(cfg.data.eval_file, base_dir)
     cfg.train.output_dir = _resolve_optional_path(cfg.train.output_dir, base_dir) or cfg.train.output_dir
+    if isinstance(cfg.train.deepspeed, str):
+        cfg.train.deepspeed = _resolve_optional_path(cfg.train.deepspeed, base_dir) or cfg.train.deepspeed
     if cfg.train.fsdp is not None and not str(cfg.train.fsdp).strip():
         cfg.train.fsdp = None
+    if isinstance(cfg.train.deepspeed, str) and not str(cfg.train.deepspeed).strip():
+        cfg.train.deepspeed = None
 
     if not Path(cfg.data.train_file).exists():
         raise FileNotFoundError(f"data.train_file not found: {cfg.data.train_file}")
     if cfg.data.eval_file and not Path(cfg.data.eval_file).exists():
         raise FileNotFoundError(f"data.eval_file not found: {cfg.data.eval_file}")
+    if isinstance(cfg.train.deepspeed, str) and not Path(cfg.train.deepspeed).exists():
+        raise FileNotFoundError(f"train.deepspeed config not found: {cfg.train.deepspeed}")
+    if cfg.train.deepspeed is not None and cfg.train.fsdp:
+        raise ValueError("Set only one backend: train.deepspeed or train.fsdp (not both).")
     if cfg.train.learning_rate <= 0.0:
         raise ValueError("train.learning_rate must be > 0.")
     if cfg.train.global_batch_size <= 0:

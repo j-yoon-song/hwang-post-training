@@ -36,7 +36,7 @@ data:
   log_text_max_chars: 0
 
 train:
-  output_dir: ../outputs/gemma3-27b-it-sft-fsdp
+  output_dir: ../outputs/gemma3-27b-it-sft-deepspeed
   seed: 42
   num_train_epochs: 1.0
   max_steps: -1
@@ -59,14 +59,5 @@ train:
   report_to: []
   resume_from_checkpoint:
   ddp_find_unused_parameters: false
+  deepspeed: ./deepspeed_zero3_8xh100.json
   expected_world_size: 8
-  fsdp: full_shard auto_wrap
-  fsdp_transformer_layer_cls_to_wrap: auto
-  fsdp_backward_prefetch: BACKWARD_PRE
-  fsdp_forward_prefetch: false
-  fsdp_cpu_offload: false
-  fsdp_use_orig_params: true
-  fsdp_limit_all_gathers: true
-  fsdp_activation_checkpointing: false
-  fsdp_sync_module_states: true
-  fsdp_cpu_ram_efficient_loading: true

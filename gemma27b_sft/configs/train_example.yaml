@@ -4,6 +4,7 @@ model:
   attn_implementation: auto
   freeze_input_embeddings: true
   freeze_output_embeddings: true
+  freeze_vision_encoder: true
 
 data:
   train_file: ../../runs/exp001/final_dataset.jsonl

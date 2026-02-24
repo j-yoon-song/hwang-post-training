@@ -407,7 +407,6 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
         return {
             "input_ids": full_ids,
             "attention_mask": [1] * len(full_ids),
-            "token_type_ids": [0] * len(full_ids),
             "labels": labels,
             "num_target_tokens": non_ignored,
             "prompt_tokens": len(prompt_ids),
@@ -717,7 +716,7 @@ def _tokenize_dataset(
 
 
 def _to_training_dataset(dataset: Dataset) -> Dataset:
-    keep_cols = {"input_ids", "attention_mask", "token_type_ids", "labels"}
+    keep_cols = {"input_ids", "attention_mask", "labels"}
     drop_cols = [name for name in dataset.column_names if name not in keep_cols]
     if drop_cols:
         dataset = dataset.remove_columns(drop_cols)
