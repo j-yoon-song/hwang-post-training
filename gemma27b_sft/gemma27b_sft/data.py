@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import hashlib
+import inspect
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -480,6 +481,7 @@ def _dataset_fingerprint(path: str, cfg: DataConfig) -> str:
 
 def _safe_load_json_dataset(path: str, cfg: DataConfig) -> Dataset:
     required_fields = _required_json_fields(cfg)
+    cache_buster = _dataset_fingerprint(path, cfg)
     stats: dict[str, Any] = {
         "bad_json": 0,
         "total_lines": 0,
@@ -491,7 +493,11 @@ def _safe_load_json_dataset(path: str, cfg: DataConfig) -> Dataset:
         "sample_cast_logs": 0,
     }
 
-    def _generator():
+    def _generator(_cache_buster: str = ""):
+        # `_cache_buster` is intentionally unused and only exists so we can
+        # vary `gen_kwargs` to invalidate stale generator caches across
+        # different datasets versions.
+        _ = _cache_buster
         with Path(path).open("r", encoding="utf-8") as f:
             for line_no, line in enumerate(f, start=1):
                 stats["total_lines"] += 1
@@ -534,11 +540,15 @@ def _safe_load_json_dataset(path: str, cfg: DataConfig) -> Dataset:
                     logger.info("JSON->datasets progress path=%s rows=%s", path, stats["rows"])
                 yield out
 
-    ds = Dataset.from_generator(
-        _generator,
-        features=_dataset_features(cfg),
-        fingerprint=_dataset_fingerprint(path, cfg),
-    )
+    from_generator_kwargs: dict[str, Any] = {
+        "features": _dataset_features(cfg),
+    }
+    signature = inspect.signature(Dataset.from_generator)
+    if "gen_kwargs" in signature.parameters:
+        from_generator_kwargs["gen_kwargs"] = {"_cache_buster": cache_buster}
+    if "fingerprint" in signature.parameters:
+        from_generator_kwargs["fingerprint"] = cache_buster
+    ds = Dataset.from_generator(_generator, **from_generator_kwargs)
     if stats["bad_json"] > 0:
         logger.warning("Ignored invalid JSON lines=%s while reading %s", stats["bad_json"], path)
     logger.info(
