@@ -142,6 +142,7 @@ class MetricXScorer:
 
             worker_script = Path(__file__).with_name("metricx_worker.py").resolve()
             env = self._build_metricx_env()
+            resolved_device = self._resolve_metricx_device(env)
             if repo_dir:
                 existing_py_path = env.get("PYTHONPATH", "")
                 env["PYTHONPATH"] = (
@@ -160,10 +161,17 @@ class MetricXScorer:
                 "--max_input_length",
                 str(self.cfg.max_input_length),
                 "--device",
-                self.cfg.device,
+                resolved_device,
                 "--qe",
             ]
 
+            if resolved_device != self.cfg.device:
+                self.logger.info(
+                    "MetricX device remapped requested=%s resolved=%s (CUDA_VISIBLE_DEVICES=%s)",
+                    self.cfg.device,
+                    resolved_device,
+                    env.get("CUDA_VISIBLE_DEVICES", ""),
+                )
             self.logger.info("Starting persistent MetricX worker: %s", " ".join(cmd))
             proc = subprocess.Popen(
                 cmd,
@@ -488,6 +496,55 @@ class MetricXScorer:
         elif device == "cpu":
             env["CUDA_VISIBLE_DEVICES"] = ""
         return env
+
+    def _resolve_metricx_device(self, env: dict[str, str]) -> str:
+        raw_device = (self.cfg.device or "").strip()
+        normalized = raw_device.lower()
+        if not raw_device:
+            return "cuda:0"
+        if normalized == "cpu":
+            return "cpu"
+        if not normalized.startswith("cuda:"):
+            return raw_device
+
+        requested_token = raw_device.split(":", maxsplit=1)[1].strip()
+        if not requested_token.isdigit():
+            return raw_device
+        requested_idx = int(requested_token)
+
+        visible_raw = (env.get("CUDA_VISIBLE_DEVICES") or "").strip()
+        if not visible_raw:
+            return f"cuda:{requested_idx}"
+        visible_tokens = [token.strip() for token in visible_raw.split(",") if token.strip()]
+        if not visible_tokens:
+            return f"cuda:{requested_idx}"
+
+        if all(token.isdigit() for token in visible_tokens):
+            visible_global = [int(token) for token in visible_tokens]
+            if requested_idx in visible_global:
+                local_idx = visible_global.index(requested_idx)
+                return f"cuda:{local_idx}"
+            if requested_idx < len(visible_tokens):
+                return f"cuda:{requested_idx}"
+            self.logger.warning(
+                "metricx.device=%s is out of visible range for CUDA_VISIBLE_DEVICES=%s. "
+                "Falling back to cuda:0.",
+                raw_device,
+                visible_raw,
+            )
+            return "cuda:0"
+
+        if requested_idx < len(visible_tokens):
+            return f"cuda:{requested_idx}"
+        if len(visible_tokens) == 1:
+            return "cuda:0"
+        self.logger.warning(
+            "metricx.device=%s cannot be mapped for CUDA_VISIBLE_DEVICES=%s. "
+            "Falling back to cuda:0.",
+            raw_device,
+            visible_raw,
+        )
+        return "cuda:0"
 
     @staticmethod
     def _heuristic_score(source: str, hypothesis: str) -> float:
