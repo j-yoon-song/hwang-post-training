@@ -47,6 +47,7 @@ class DataConfig:
     preprocessing_num_workers: int = 4
     log_text_samples: int = 3
     log_text_max_chars: int = 0
+    log_chat_template_text: bool = False
 
 
 @dataclass
