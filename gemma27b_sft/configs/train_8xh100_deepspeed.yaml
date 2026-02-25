@@ -8,7 +8,7 @@ model:
 
 data:
   train_file: ../../runs/exp001/final_dataset.jsonl
-  eval_file:
+  eval_file: ../../runs/evals/wmt24pp_enko_eval.jsonl
   source_field: source_text
   target_field: target_text
   source_lang_name: auto

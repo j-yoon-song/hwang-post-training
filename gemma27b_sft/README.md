@@ -88,6 +88,24 @@ If `data.eval_file` is empty/null:
 If `data.eval_file` is set but the file does not exist:
 - startup fails with `FileNotFoundError`
 
+### Optional: Use WMT24++ en-ko as Eval Set
+
+Prepare eval JSONL in the same format (`source_text`, `target_text`):
+
+```bash
+cd gemma27b_sft
+python3 scripts/prepare_wmt24pp_eval.py --overwrite
+```
+
+Default output:
+- `../runs/evals/wmt24pp_enko_eval.jsonl`
+
+The generated JSONL also includes:
+- `source_lang_code=en`, `target_lang_code=ko`
+- language names and WMT24++ metadata fields
+
+`configs/train_8xh100_deepspeed.yaml` is configured to use this file as `data.eval_file`.
+
 ## 3) Batch Size Rule
 
 Global batch is configurable and checked at startup.
