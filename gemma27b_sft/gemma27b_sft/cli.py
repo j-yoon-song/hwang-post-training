@@ -438,6 +438,17 @@ def _build_training_arguments(
             "TrainingArguments(deepspeed=...). Upgrade transformers."
         )
 
+    eval_mode = "steps" if has_eval else "no"
+    effective_save_steps = cfg.train.save_steps
+    if has_eval and eval_mode == "steps" and cfg.train.save_steps != cfg.train.eval_steps:
+        logger.warning(
+            "load_best_model_at_end requires aligned checkpoint/eval cadence. "
+            "Overriding save_steps from %s to eval_steps=%s.",
+            cfg.train.save_steps,
+            cfg.train.eval_steps,
+        )
+        effective_save_steps = cfg.train.eval_steps
+
     kwargs: dict[str, object] = {
         "output_dir": str(output_dir),
         "seed": cfg.train.seed,
@@ -451,7 +462,7 @@ def _build_training_arguments(
         "warmup_ratio": cfg.train.warmup_ratio,
         "weight_decay": cfg.train.weight_decay,
         "logging_steps": cfg.train.logging_steps,
-        "save_steps": cfg.train.save_steps,
+        "save_steps": effective_save_steps,
         "eval_steps": cfg.train.eval_steps,
         "save_total_limit": cfg.train.save_total_limit,
         "bf16": cfg.train.bf16,
@@ -462,6 +473,10 @@ def _build_training_arguments(
         "remove_unused_columns": False,
         "ddp_find_unused_parameters": cfg.train.ddp_find_unused_parameters,
     }
+    if has_eval:
+        kwargs["load_best_model_at_end"] = True
+        kwargs["metric_for_best_model"] = "eval_loss"
+        kwargs["greater_is_better"] = False
     if cfg.train.deepspeed is not None:
         kwargs["deepspeed"] = cfg.train.deepspeed
     if cfg.train.fsdp:
@@ -485,7 +500,6 @@ def _build_training_arguments(
                 "Enabling save_only_model for FSDP runs to avoid optimizer-state "
                 "save failures with Adafactor. Resume will reload model weights only."
             )
-    eval_mode = "steps" if has_eval else "no"
     if "evaluation_strategy" in ta_params:
         kwargs["evaluation_strategy"] = eval_mode
     elif "eval_strategy" in ta_params:

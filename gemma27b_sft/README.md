@@ -87,6 +87,9 @@ If `data.eval_file` is empty/null:
 
 If `data.eval_file` is set but the file does not exist:
 - startup fails with `FileNotFoundError`
+- when eval is enabled, training tracks `eval_loss` and keeps the best checkpoint
+  (`load_best_model_at_end=true`, `metric_for_best_model=eval_loss`).
+  Final `trainer.save_model()` writes the best-eval model weights.
 
 ### Optional: Use WMT24++ en-ko as Eval Set
 

@@ -253,6 +253,13 @@ def _common_prefix_len(left: list[int], right: list[int]) -> int:
     return i
 
 
+def _tail_contains_token(token_ids: list[int], token_id: int | None, window: int = 8) -> bool:
+    if token_id is None or not token_ids:
+        return False
+    tail = token_ids[-max(1, window) :]
+    return int(token_id) in tail
+
+
 def _extract_template_target_span(
     tokenizer: PreTrainedTokenizerBase,
     prompt_messages: list[dict[str, str]],
@@ -393,14 +400,18 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
                             target_ids.append(int(eot_token_id))
                         else:
                             target_ids[-1] = int(eot_token_id)
-                elif eos_token_id is not None and (not target_ids or target_ids[-1] != eos_token_id):
-                    if len(prompt_ids) + len(target_ids) < max_len:
-                        target_ids.append(int(eos_token_id))
-                    elif target_ids:
-                        target_ids[-1] = int(eos_token_id)
-                    elif prompt_ids:
-                        prompt_ids = prompt_ids[:-1]
-                        target_ids = [int(eos_token_id)]
+                elif not use_template_target and eos_token_id is not None:
+                    # For template-derived targets (Qwen/Gemma chat templates), do not force-append EOS.
+                    # They usually already include turn-end markers and forced EOS can duplicate terminal tokens.
+                    eos_in_tail = _tail_contains_token(target_ids, int(eos_token_id), window=8)
+                    if not eos_in_tail:
+                        if len(prompt_ids) + len(target_ids) < max_len:
+                            target_ids.append(int(eos_token_id))
+                        elif target_ids:
+                            target_ids[-1] = int(eos_token_id)
+                        elif prompt_ids:
+                            prompt_ids = prompt_ids[:-1]
+                            target_ids = [int(eos_token_id)]
 
             full_ids = prompt_ids + target_ids
             labels = ([-100] * len(prompt_ids)) + target_ids
