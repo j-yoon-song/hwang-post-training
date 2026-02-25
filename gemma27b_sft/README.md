@@ -286,6 +286,10 @@ CONFIG_PATH=configs/train_8xh100_deepspeed.yaml bash scripts/sample_infer.sh
     keeps Qwen3 behavior unchanged.
   - `token_type_ids` is emitted only when required by tokenizer/model runtime
     (and forced for Gemma3 safety), so mixed-model configs do not break.
+  - Tokenizer loading is `use_fast=True` first, then automatic `use_fast=False`
+    fallback when fast tokenizer backend initialization fails.
+  - You can set `model.tokenizer_name_or_path` if model checkpoint path and
+    tokenizer path are different.
   - `sample_infer.sh` uses EOS stop by default and adds `<end_of_turn>` stop
     only when that token exists in the tokenizer vocab.
 

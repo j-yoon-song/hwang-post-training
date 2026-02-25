@@ -255,6 +255,62 @@ def _is_gemma3_model_name(model_name: str) -> bool:
     return "gemma-3" in lowered or "gemma3" in lowered
 
 
+def _resolve_tokenizer_name_or_path(cfg: SFTConfig) -> str:
+    raw = cfg.model.tokenizer_name_or_path
+    if raw is None:
+        return cfg.model.name_or_path
+    value = str(raw).strip()
+    return value or cfg.model.name_or_path
+
+
+def _load_tokenizer(cfg: SFTConfig):
+    tokenizer_name_or_path = _resolve_tokenizer_name_or_path(cfg)
+    kwargs: dict[str, Any] = {"trust_remote_code": cfg.model.trust_remote_code}
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name_or_path,
+            use_fast=True,
+            **kwargs,
+        )
+        logger.info("Loaded fast tokenizer from %s", tokenizer_name_or_path)
+        return tokenizer
+    except Exception as fast_exc:  # pylint: disable=broad-except
+        logger.warning(
+            "Fast tokenizer load failed for %s: %s. Retrying with use_fast=False.",
+            tokenizer_name_or_path,
+            fast_exc,
+        )
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name_or_path,
+            use_fast=False,
+            **kwargs,
+        )
+        logger.warning(
+            "Using slow tokenizer fallback from %s. This is expected when fast tokenizer files "
+            "are missing/corrupted and may reduce throughput.",
+            tokenizer_name_or_path,
+        )
+        return tokenizer
+    except Exception as slow_exc:  # pylint: disable=broad-except
+        resolved_path = Path(tokenizer_name_or_path).expanduser()
+        extra_hint = ""
+        if resolved_path.exists():
+            extra_hint = (
+                f" Local tokenizer path exists ({resolved_path}) but may miss tokenizer files "
+                "(tokenizer.json or vocab.json+merges.txt)."
+            )
+        raise RuntimeError(
+            "Tokenizer load failed in both fast and slow modes.\n"
+            f"- tokenizer_name_or_path={tokenizer_name_or_path}\n"
+            "- For Qwen3, ensure the tokenizer repo/files are complete.\n"
+            "- If loading from a fine-tuned checkpoint path, point tokenizer to the base model "
+            "or copy tokenizer files into that checkpoint.\n"
+            "- Try reinstalling/upgrading transformers/tokenizers and clearing broken HF cache."
+            + extra_hint
+        ) from slow_exc
+
+
 def _ensure_gemma3_tokenizer_attrs(tokenizer) -> bool:
     init_kwargs = getattr(tokenizer, "init_kwargs", {})
     extra = dict(getattr(tokenizer, "extra_special_tokens", {}) or {})
@@ -628,7 +684,7 @@ def run(cfg: SFTConfig) -> None:
     dump_config(cfg, output_dir / "resolved_config.yaml")
     _validate_launch(cfg)
 
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model.name_or_path, use_fast=True)
+    tokenizer = _load_tokenizer(cfg)
     tokenizer.padding_side = "right"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

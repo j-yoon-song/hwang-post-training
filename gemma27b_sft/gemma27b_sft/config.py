@@ -22,6 +22,7 @@ DEFAULT_TRANSLATION_PROMPT_TEMPLATE = (
 @dataclass
 class ModelConfig:
     name_or_path: str = "google/gemma-3-27b-it"
+    tokenizer_name_or_path: str | None = None
     trust_remote_code: bool = False
     attn_implementation: str | None = "auto"
     freeze_input_embeddings: bool = True
