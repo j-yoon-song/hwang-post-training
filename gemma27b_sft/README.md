@@ -264,8 +264,10 @@ CONFIG_PATH=configs/train_8xh100_deepspeed.yaml bash scripts/sample_infer.sh
   - Set `data.log_text_max_chars: 0` to disable truncation completely.
   - CLI also emits tokenization risk warnings when many samples are truncated.
 - Qwen3 compatibility
-  - Training batches only include `input_ids`, `attention_mask`, `labels`
-    (no forced `token_type_ids`).
+  - Qwen3 tokenizer inputs are `input_ids` + `attention_mask`; this pipeline
+    keeps Qwen3 behavior unchanged.
+  - `token_type_ids` is emitted only when required by tokenizer/model runtime
+    (and forced for Gemma3 safety), so mixed-model configs do not break.
   - `sample_infer.sh` uses EOS stop by default and adds `<end_of_turn>` stop
     only when that token exists in the tokenizer vocab.
 

@@ -62,19 +62,33 @@ class FixedAdafactorTrainer(Trainer):
 
 
 class DataCollatorCausalLM:
-    def __init__(self, tokenizer, pad_to_multiple_of: int | None = 8) -> None:
+    def __init__(
+        self,
+        tokenizer,
+        pad_to_multiple_of: int | None = 8,
+        force_token_type_ids: bool = False,
+    ) -> None:
         self.tokenizer = tokenizer
         self.pad_to_multiple_of = pad_to_multiple_of
+        model_input_names = set(getattr(tokenizer, "model_input_names", []) or [])
+        self._expects_token_type_ids = force_token_type_ids or ("token_type_ids" in model_input_names)
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         labels = [feature["labels"] for feature in features]
-        model_features = [{k: v for k, v in feature.items() if k != "labels"} for feature in features]
+        model_features = []
+        for feature in features:
+            sample = {k: v for k, v in feature.items() if k != "labels"}
+            if self._expects_token_type_ids and "token_type_ids" not in sample:
+                sample["token_type_ids"] = [0] * len(sample["input_ids"])
+            model_features.append(sample)
         batch = self.tokenizer.pad(
             model_features,
             padding=True,
             return_tensors="pt",
             pad_to_multiple_of=self.pad_to_multiple_of,
         )
+        if self._expects_token_type_ids and "token_type_ids" not in batch:
+            batch["token_type_ids"] = torch.zeros_like(batch["input_ids"], dtype=torch.long)
         max_len = int(batch["input_ids"].shape[1])
         padded_labels = torch.full((len(labels), max_len), -100, dtype=torch.long)
         for i, label in enumerate(labels):
@@ -690,7 +704,11 @@ def run(cfg: SFTConfig) -> None:
         has_eval=eval_ds is not None,
         hf_gradient_checkpointing=use_hf_gradient_ckpt,
     )
-    collator = DataCollatorCausalLM(tokenizer=tokenizer, pad_to_multiple_of=8)
+    collator = DataCollatorCausalLM(
+        tokenizer=tokenizer,
+        pad_to_multiple_of=8,
+        force_token_type_ids=_is_gemma3_model_name(cfg.model.name_or_path),
+    )
 
     trainer = _build_trainer(
         model=model,

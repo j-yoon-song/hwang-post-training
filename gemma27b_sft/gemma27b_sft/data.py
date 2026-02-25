@@ -309,6 +309,13 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
     max_len = cfg.train.max_seq_length
     eos_token_id = tokenizer.eos_token_id
     eot_token_id = tokenizer.convert_tokens_to_ids("<end_of_turn>")
+    model_input_names = set(getattr(tokenizer, "model_input_names", []) or [])
+    model_name_lower = cfg.model.name_or_path.lower()
+    emit_token_type_ids = (
+        "token_type_ids" in model_input_names
+        or "gemma-3" in model_name_lower
+        or "gemma3" in model_name_lower
+    )
     if eot_token_id is None or eot_token_id == tokenizer.unk_token_id:
         eot_token_id = None
 
@@ -404,7 +411,7 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
             source_text = source_text[: max(1, len(source_text) // 2)]
             source_shrink_steps += 1
 
-        return {
+        output = {
             "input_ids": full_ids,
             "attention_mask": [1] * len(full_ids),
             "labels": labels,
@@ -416,6 +423,9 @@ def _build_tokenize_fn(cfg: SFTConfig, tokenizer: PreTrainedTokenizerBase):
             "source_shrink_steps": source_shrink_steps,
             "target_chars": len(target_text),
         }
+        if emit_token_type_ids:
+            output["token_type_ids"] = [0] * len(full_ids)
+        return output
 
     return _tokenize
 
@@ -716,7 +726,7 @@ def _tokenize_dataset(
 
 
 def _to_training_dataset(dataset: Dataset) -> Dataset:
-    keep_cols = {"input_ids", "attention_mask", "labels"}
+    keep_cols = {"input_ids", "attention_mask", "labels", "token_type_ids"}
     drop_cols = [name for name in dataset.column_names if name not in keep_cols]
     if drop_cols:
         dataset = dataset.remove_columns(drop_cols)
