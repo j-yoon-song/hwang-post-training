@@ -78,6 +78,14 @@ def update_policy(
     total_entropy = 0.0
     total_ref_kl = 0.0
 
+    # Pre-compute total token count for uniform per-token gradient weighting.
+    expected_total_tokens = sum(
+        min(len(r.completion_token_ids), len(r.old_logprobs), len(a))
+        for r, a in zip(rollouts, advantages)
+    )
+    if expected_total_tokens <= 0:
+        raise RuntimeError("No valid tokens found for update.")
+
     for rollout, adv_row in zip(rollouts, advantages):
         input_ids = torch.tensor(
             [rollout.prompt_input_ids + rollout.completion_token_ids],
@@ -102,15 +110,18 @@ def update_policy(
             continue
 
         if rl_cfg.algorithm == "grpo":
-            ratio = torch.exp(new_lp - old_lp)
+            log_ratio = new_lp - old_lp
+            log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
+            ratio = torch.exp(log_ratio)
             clipped = torch.clamp(ratio, 1.0 - rl_cfg.clip_eps, 1.0 + rl_cfg.clip_eps)
             per_token_loss = -torch.minimum(ratio * adv, clipped * adv)
             clip_fraction = ((ratio > (1.0 + rl_cfg.clip_eps)) | (ratio < (1.0 - rl_cfg.clip_eps))).float()
-            approx_kl = 0.5 * ((new_lp - old_lp) ** 2)
+            approx_kl = 0.5 * (log_ratio ** 2)
         elif rl_cfg.algorithm == "reinforce":
             per_token_loss = -(new_lp * adv)
             clip_fraction = torch.zeros_like(new_lp)
-            approx_kl = 0.5 * ((new_lp - old_lp) ** 2)
+            log_ratio = new_lp - old_lp
+            approx_kl = 0.5 * (log_ratio ** 2)
         else:
             raise ValueError(f"Unsupported algorithm: {rl_cfg.algorithm}")
 
@@ -132,7 +143,7 @@ def update_policy(
         total_clip += float(clip_fraction.detach().sum().item())
         total_approx_kl += float(approx_kl.detach().sum().item())
 
-        micro_loss = per_token_loss.mean() / max(1, rl_cfg.grad_accum)
+        micro_loss = per_token_loss.sum() / max(1, expected_total_tokens)
         micro_loss.backward()
         pending_backward += 1
         if pending_backward % max(1, rl_cfg.grad_accum) == 0:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from typing import Iterable
 
@@ -44,15 +45,15 @@ def apply_group_relative_advantage(
     group_to_indices: dict[str, list[int]] = defaultdict(list)
     rollout_scalar: list[float] = []
     for idx, arr in enumerate(raw_advantages):
-        scalar = sum(arr) / max(1, len(arr))
+        scalar = math.fsum(arr) / max(1, len(arr))
         rollout_scalar.append(float(scalar))
         group_to_indices[group_ids[idx]].append(idx)
 
     group_z = [0.0 for _ in raw_advantages]
     for indices in group_to_indices.values():
         vals = [rollout_scalar[i] for i in indices]
-        mean = sum(vals) / max(1, len(vals))
-        var = sum((v - mean) ** 2 for v in vals) / max(1, len(vals))
+        mean = math.fsum(vals) / max(1, len(vals))
+        var = math.fsum((v - mean) ** 2 for v in vals) / max(1, len(vals))
         std = var**0.5
         denom = std + eps
         for i in indices:
@@ -86,8 +87,8 @@ def normalize_advantages(
             "norm_std": 0.0,
         }
 
-    raw_mean = sum(flat) / len(flat)
-    raw_var = sum((v - raw_mean) ** 2 for v in flat) / len(flat)
+    raw_mean = math.fsum(flat) / len(flat)
+    raw_var = math.fsum((v - raw_mean) ** 2 for v in flat) / len(flat)
     raw_std = raw_var**0.5
 
     normalized: list[list[float]] = []
@@ -95,8 +96,8 @@ def normalize_advantages(
         normalized.append([float((v - raw_mean) / (raw_std + eps)) for v in row])
 
     norm_flat = _flatten(normalized)
-    norm_mean = sum(norm_flat) / len(norm_flat)
-    norm_var = sum((v - norm_mean) ** 2 for v in norm_flat) / len(norm_flat)
+    norm_mean = math.fsum(norm_flat) / len(norm_flat)
+    norm_var = math.fsum((v - norm_mean) ** 2 for v in norm_flat) / len(norm_flat)
     norm_std = norm_var**0.5
 
     return normalized, {
