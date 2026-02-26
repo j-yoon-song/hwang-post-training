@@ -1,0 +1,126 @@
+model:
+  policy_name_or_path: Qwen/Qwen3.5-35B-A3B
+  reference_name_or_path: Qwen/Qwen3.5-35B-A3B
+  trust_remote_code: true
+  attn_implementation: auto
+  use_fast_tokenizer: true
+  reference_device: cpu
+  policy_gpu_ids: []
+  reference_gpu_ids: []
+  gradient_checkpointing: true
+  gradient_checkpointing_kwargs:
+    use_reentrant: false
+
+data:
+  train_file: ../runs/exp001/final_dataset.jsonl
+  eval_file: null
+  default_src_lang: English
+  default_tgt_lang: Korean
+  default_src_lang_code: en
+  default_tgt_lang_code: ko
+
+prompt:
+  template: >-
+    You are a professional {source_lang} ({src_lang_code}) to {target_lang} ({tgt_lang_code})
+    translator. Your goal is to accurately convey the meaning and nuances of the original
+    {source_lang} text while adhering to {target_lang} grammar, vocabulary, and cultural
+    sensitivities. Produce only the {target_lang} translation, without any additional
+    explanations or commentary. Please translate the following {source_lang} text into
+    {target_lang}:\n\n{text}
+
+generation:
+  max_new_tokens: 128
+  temperature: 0.8
+  top_p: 0.95
+  top_k: 50
+  num_samples_per_prompt: 2
+  do_sample: true
+  repetition_penalty: 1.0
+
+reward:
+  w_metricx: 1.0
+  w_xcomet_seq: 0.0
+  xcomet_seq_scale: 1.0
+  severity_weights:
+    MINOR: -1.0
+    MAJOR: -5.0
+    CRITICAL: -10.0
+  overlap_policy: any_overlap
+  majority_threshold: 0.5
+  use_confidence: false
+  span_combine_policy: sum
+  cache_enabled: true
+
+  metricx:
+    enabled: true
+    model_name: google/metricx-24-hybrid-large-v2p6
+    tokenizer_name: google/mt5-xl
+    use_reference: false
+    batch_size: 4
+    device: cuda
+    dtype: bfloat16
+    max_input_length: 2048
+    overflow_policy: truncate
+    offset: 5.0
+
+  xcomet:
+    enabled: true
+    model_name: Unbabel/XCOMET-XL
+    batch_size: 2
+    device: cuda
+    use_reference: false
+
+rl:
+  algorithm: gspo
+  lr: 1.0e-6
+  weight_decay: 0.0
+  batch_size: 2
+  grad_accum: 1
+  clip_eps: 0.2
+  kl_coef: 0.01
+  entropy_coef: 0.0
+  max_grad_norm: 1.0
+  ppo_epochs: 1
+  updates: 20
+  normalize_advantage: true
+  group_normalize: true
+  group_advantage_coef: 1.0
+  eps: 1.0e-8
+  # MoE-specific settings
+  output_router_logits: true
+  router_aux_loss_coef: 0.001
+  monitor_expert_utilization: true
+
+eval:
+  eval_every_n_updates: 5
+  eval_limit: 64
+  run_before_train: true
+
+logging:
+  output_dir: ./outputs/qwen35-gspo-toy
+  jsonl_name: train_log.jsonl
+  rollout_jsonl_name: train_rollouts.jsonl
+  save_rollouts: false
+  eval_output_jsonl_name: eval_outputs.jsonl
+  save_eval_outputs: false
+  save_every_n_updates: 10
+
+misc:
+  seed: 42
+  device: cuda
+  dtype: bfloat16
+  huggingface_cache_dir: /media/sdd3
+  huggingface_token: null
+  huggingface_token_env: HF_TOKEN
+
+# Distributed training (opt-in, zero overhead when disabled).
+# Enable and launch with: torchrun --nproc_per_node=N -m qwen3.5-35b-a3b --config ...
+# Or with DeepSpeed: deepspeed --num_gpus=N -m qwen3.5-35b-a3b --config ...
+distributed:
+  enabled: false
+  backend: deepspeed        # deepspeed | fsdp | ddp
+  zero_stage: 2             # 0, 1, 2, 3 (DeepSpeed only)
+  offload_optimizer: false  # optimizer state → CPU (ZeRO-Offload)
+  offload_param: false      # parameters → CPU (ZeRO-3 only)
+  # deepspeed_config_path: null  # Uncomment to use an external JSON config
+  fsdp_sharding_strategy: FULL_SHARD  # FULL_SHARD | SHARD_GRAD_OP | NO_SHARD

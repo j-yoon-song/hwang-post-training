@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen35-moe-rl"
+version = "0.1.0"
+description = "GSPO/GRPO-style RL post-training pipeline for Qwen3.5-35B-A3B MoE translation models"
+requires-python = ">=3.10"
+dependencies = [
+  "PyYAML>=6.0.1",
+  "datasets>=2.21.0",
+  "sentencepiece>=0.2.0",
+  "torch>=2.2.0",
+  "transformers>=4.51.0",
+]
+
+[project.optional-dependencies]
+reward = [
+  "unbabel-comet>=2.2.0",
+]
+test = [
+  "pytest>=8.0.0",
+]
+
+[project.scripts]
+qwen35_moe_rl = "qwen3.5-35b-a3b.cli:main"
+
+[tool.setuptools]
+packages = ["qwen3.5-35b-a3b"]
