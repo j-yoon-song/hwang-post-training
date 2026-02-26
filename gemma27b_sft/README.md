@@ -24,6 +24,12 @@ For 8x H100 DeepSpeed full fine-tuning, also install DeepSpeed on the training n
 uv pip install "deepspeed>=0.14.0"
 ```
 
+For XCOMET eval, install optional dependency:
+
+```bash
+uv pip install "unbabel-comet>=2.2.0"
+```
+
 Training preprocessing uses Hugging Face `datasets`
 (`>=2.21.0,<5.0.0`; supports 4.x).
 When using `datasets` 4.x, use `pyarrow>=21.0.0`.
@@ -170,6 +176,14 @@ This config currently uses:
 - `train.deepspeed: ./deepspeed_zero3_8xh100.json`
 - `train.expected_world_size: 8`
 
+TRL SFTTrainer variant (same config/params, separate entrypoint):
+
+```bash
+cd gemma27b_sft
+source .venv/bin/activate
+torchrun --nproc_per_node=8 -m gemma27b_sft.cli_trl --config configs/train_8xh100_deepspeed.yaml
+```
+
 5) Resume from a checkpoint:
 
 ```yaml
@@ -234,6 +248,29 @@ MODEL_DIR=../outputs/gemma3-27b-it-sft-deepspeed/checkpoint-1000 bash scripts/sa
 SRC_TEXT="I love this project." bash scripts/sample_infer.sh
 CONFIG_PATH=configs/train_8xh100_deepspeed.yaml bash scripts/sample_infer.sh
 ```
+
+## 5.1) XCOMET Eval (Loss + Quality)
+
+To evaluate a trained checkpoint on `data.eval_file` with XCOMET:
+
+```bash
+cd gemma27b_sft
+python3 scripts/eval_xcomet.py \
+  --config configs/train_8xh100_deepspeed.yaml \
+  --model-dir ../outputs/gemma3-27b-it-sft-deepspeed \
+  --max-samples 256 \
+  --use-reference \
+  --overwrite
+```
+
+Outputs:
+- `<model-dir>/xcomet_eval_summary.json`
+- `<model-dir>/xcomet_eval_predictions.jsonl`
+
+Memory safety note:
+- This script generates translations first, then releases the translation model and runs XCOMET.
+- To minimize OOM risk, keep `--xcomet-device cpu` (default) or use a different free GPU.
+- Running XCOMET during training steps on the same GPU as 27B SFT is not recommended.
 
 ## 6) Config Notes
 
