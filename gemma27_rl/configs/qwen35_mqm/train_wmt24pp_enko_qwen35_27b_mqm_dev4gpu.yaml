@@ -82,6 +82,8 @@ reward:
     max_input_length: 2048
     overflow_policy: truncate
     offset: 5.0
+    python_executable: ../../.venv_metricx/bin/python
+    subprocess_timeout_sec: 1800.0
 
   xcomet:
     enabled: false
@@ -89,6 +91,8 @@ reward:
     batch_size: 1
     device: cuda:2
     use_reference: false
+    python_executable: ../../.venv_xcomet/bin/python
+    subprocess_timeout_sec: 1800.0
 
   mqm:
     enabled: true

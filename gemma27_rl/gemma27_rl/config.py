@@ -88,6 +88,8 @@ class MetricXConfig:
     max_input_length: int = 2048
     overflow_policy: str = "truncate"  # truncate|skip
     offset: float = 5.0
+    python_executable: str | None = None
+    subprocess_timeout_sec: float = 600.0
 
 
 @dataclass
@@ -97,6 +99,8 @@ class XCometConfig:
     batch_size: int = 2
     device: str = "cuda"
     use_reference: bool = False
+    python_executable: str | None = None
+    subprocess_timeout_sec: float = 600.0
 
 
 @dataclass
@@ -245,6 +249,20 @@ def _resolve_optional_path(value: str | None, base_dir: Path) -> str | None:
     return str((base_dir / path).resolve())
 
 
+def _resolve_command_or_path(value: str | None, base_dir: Path) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return value
+    if "/" not in text and "\\" not in text and not text.startswith(".") and not text.startswith("~"):
+        return text
+    path = Path(text).expanduser()
+    if path.is_absolute():
+        return str(path)
+    return str((base_dir / path).resolve())
+
+
 def _resolve_model_name_or_path(value: str | None, base_dir: Path) -> str | None:
     if value is None:
         return None
@@ -324,6 +342,19 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("reward.overlap_policy must be any_overlap or majority_overlap")
     if cfg.reward.span_combine_policy not in {"sum", "min", "max"}:
         raise ValueError("reward.span_combine_policy must be sum|min|max")
+    if float(cfg.reward.metricx.subprocess_timeout_sec) <= 0:
+        raise ValueError("reward.metricx.subprocess_timeout_sec must be > 0.")
+    if float(cfg.reward.xcomet.subprocess_timeout_sec) <= 0:
+        raise ValueError("reward.xcomet.subprocess_timeout_sec must be > 0.")
+    for field_name, exe in (
+        ("reward.metricx.python_executable", cfg.reward.metricx.python_executable),
+        ("reward.xcomet.python_executable", cfg.reward.xcomet.python_executable),
+    ):
+        if exe is None:
+            continue
+        text = str(exe).strip()
+        if not text:
+            raise ValueError(f"{field_name} must not be empty when set.")
     if not cfg.reward.metricx.enabled and not cfg.reward.xcomet.enabled and not cfg.reward.mqm.enabled:
         raise ValueError("At least one reward model must be enabled.")
     if cfg.reward.mqm.error_policy not in {"raise", "zero"}:
@@ -411,6 +442,8 @@ def load_config(path: str | Path) -> RLPostTrainConfig:
     cfg.logging.resume_from_checkpoint = _resolve_optional_path(cfg.logging.resume_from_checkpoint, base_dir)
     cfg.misc.huggingface_cache_dir = _resolve_optional_path(cfg.misc.huggingface_cache_dir, base_dir)
     cfg.rl.deepspeed_config_path = _resolve_optional_path(cfg.rl.deepspeed_config_path, base_dir)
+    cfg.reward.metricx.python_executable = _resolve_command_or_path(cfg.reward.metricx.python_executable, base_dir)
+    cfg.reward.xcomet.python_executable = _resolve_command_or_path(cfg.reward.xcomet.python_executable, base_dir)
 
     _validate_config(cfg)
     return cfg

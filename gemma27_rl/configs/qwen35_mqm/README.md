@@ -5,6 +5,8 @@ This folder contains isolated configs for RL experiments with:
 - sequence rewards: `MetricX-24-XXL` + `GEMBA-MQM`
 - **xCOMET disabled**
 - **DeepSpeed backend enabled** (no `device_map=auto`)
+- scorer runtime isolation: MetricX/xCOMET can run on separate uv envs via
+  `reward.metricx.python_executable` / `reward.xcomet.python_executable`.
 
 MQM prompt/scoring behavior is aligned with:
 `/home/seungyoonee/initial_translation/configs/metrics/gemba_mqm.yaml`
@@ -27,14 +29,21 @@ and the message/scoring logic in:
 
 ## Run
 
+Create split uv envs (example):
+
+```bash
+cd /home/seungyoonee/make-synthetic-data/gemma27_rl
+./scripts/setup_split_uv_envs.sh
+```
+
 ```bash
 export HF_TOKEN=...
 export OPENAI_API_KEY=...
-deepspeed --num_gpus 4 -m gemma27_rl.cli --config configs/qwen35_mqm/train_wmt24pp_enko_qwen35_27b_mqm_dev4gpu.yaml
+.venv_train/bin/deepspeed --num_gpus 4 .venv_train/bin/gemma27_rl --config configs/qwen35_mqm/train_wmt24pp_enko_qwen35_27b_mqm_dev4gpu.yaml
 ```
 
 or
 
 ```bash
-deepspeed --num_gpus 8 -m gemma27_rl.cli --config configs/qwen35_mqm/train_wmt24pp_enko_qwen35_27b_mqm_scale8gpu.yaml
+.venv_train/bin/deepspeed --num_gpus 8 .venv_train/bin/gemma27_rl --config configs/qwen35_mqm/train_wmt24pp_enko_qwen35_27b_mqm_scale8gpu.yaml
 ```

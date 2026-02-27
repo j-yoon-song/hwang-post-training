@@ -23,6 +23,12 @@ uv pip install -r requirements.txt
 uv pip install -e .
 ```
 
+분리 환경(학습/MetricX/xCOMET)을 쓰려면:
+
+```bash
+./scripts/setup_split_uv_envs.sh
+```
+
 ## 2) 설정
 
 기본 예시: `configs/train_toy.yaml`
@@ -42,6 +48,8 @@ Qwen3.5 + MQM 전용 예시: `configs/qwen35_mqm/`
   (`data.eval_sampling_seed` + `data.id_field` 기반 해시로 고정 분할)
 - `generation.num_samples_per_prompt`: GRPO group 크기
 - `reward.metricx.*`, `reward.xcomet.*`, `reward.mqm.*`
+- `reward.metricx.python_executable`: MetricX를 별도 uv 환경 파이썬으로 실행할 때 지정
+- `reward.xcomet.python_executable`: xCOMET을 별도 uv 환경 파이썬으로 실행할 때 지정
 - `rl.*` (clip, kl, batch, updates)
 - `misc.huggingface_cache_dir`: HF 캐시 루트 (예: `/media/sdd3`)
 - `misc.huggingface_token`: (권장 비활성) 직접 토큰 입력값
@@ -55,6 +63,8 @@ GPU 배치(자동):
 - `xcomet`은 Lightning `Trainer` 재생성을 피하고 모델을 메모리에 상주시켜,
   반복 스코어링 시 초기화 오버헤드를 줄입니다.
 - `mqm`은 외부 OpenAI-compatible API judge를 호출하므로 로컬 GPU를 점유하지 않습니다.
+- `reward.metricx.python_executable`/`reward.xcomet.python_executable`가 설정되면
+  각 scorer는 학습 프로세스와 분리된 서브프로세스(해당 Python)에서 모델을 로드/추론합니다.
 
 GPU 배치(명시적 8-GPU 분할):
 - `model.policy_gpu_ids`/`model.reference_gpu_ids`를 설정하면 자동 배치보다 우선합니다.
@@ -87,7 +97,7 @@ python -m gemma27_rl.cli --config configs/train_toy.yaml
 DeepSpeed 학습(예: 8 GPU):
 
 ```bash
-deepspeed --num_gpus 8 -m gemma27_rl.cli --config configs/qwen35_mqm/train_wmt24pp_enko_qwen35_27b_mqm_scale8gpu.yaml
+deepspeed --num_gpus 8 .venv_train/bin/gemma27_rl --config configs/qwen35_mqm/train_wmt24pp_enko_qwen35_27b_mqm_scale8gpu.yaml
 ```
 
 평가만:
