@@ -115,6 +115,7 @@ reward:
     error_policy: raise
 
 rl:
+  backend: deepspeed
   algorithm: grpo
   lr: 1.0e-6
   weight_decay: 0.0
@@ -130,6 +131,10 @@ rl:
   group_normalize: true
   group_advantage_coef: 1.0
   eps: 1.0e-8
+  deepspeed_config_path: null
+  deepspeed_zero_stage: 2
+  deepspeed_offload_optimizer: false
+  deepspeed_offload_param: false
 
 eval:
   eval_every_n_updates: 5

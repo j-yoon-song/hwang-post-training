@@ -58,9 +58,11 @@ GPU 배치(자동):
 
 GPU 배치(명시적 8-GPU 분할):
 - `model.policy_gpu_ids`/`model.reference_gpu_ids`를 설정하면 자동 배치보다 우선합니다.
-- 이 경우 policy/reference는 지정한 GPU 목록에 `device_map=auto`로 로드됩니다.
+- `device_map=auto` 경로는 비활성화되어 있습니다.
+- policy를 여러 GPU에 올리려면 `rl.backend: deepspeed`를 사용하고 `deepspeed` launcher로 실행하세요.
+- reference 모델은 단일 GPU(`reference_gpu_ids` 첫 번째)만 사용합니다.
 - MetricX/XCOMET은 `reward.metricx.device`, `reward.xcomet.device`로 단일 GPU를 직접 지정하세요.
-- 예시(3/3/1/1): `policy=[0,1,2]`, `reference=[3,4,5]`, `metricx=cuda:6`, `xcomet=cuda:7`.
+- 예시(6/1/1): `policy=[0,1,2,3,4,5]`, `reference=[6]`, `metricx=cuda:7`.
 
 GEMBA-MQM 프롬프트/스코어링:
 - MQM judge 메시지 구성은 아래 구현을 따릅니다.
@@ -80,6 +82,12 @@ python -m gemma27_rl.cli --config configs/train_toy.yaml
 
 ```bash
 python -m gemma27_rl.cli --config configs/train_toy.yaml
+```
+
+DeepSpeed 학습(예: 8 GPU):
+
+```bash
+deepspeed --num_gpus 8 -m gemma27_rl.cli --config configs/qwen35_mqm/train_wmt24pp_enko_qwen35_27b_mqm_scale8gpu.yaml
 ```
 
 평가만:

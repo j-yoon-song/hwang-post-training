@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 from pathlib import Path
 import random
 import shutil
@@ -10,7 +11,13 @@ from statistics import mean
 from typing import Any
 
 import torch
+import yaml
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+try:
+    import deepspeed
+except Exception:  # pragma: no cover - optional dependency
+    deepspeed = None  # type: ignore[assignment]
 
 from .advantage import (
     apply_group_relative_advantage,
@@ -42,6 +49,135 @@ from .utils import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _is_distributed_initialized() -> bool:
+    return bool(torch.distributed.is_available() and torch.distributed.is_initialized())
+
+
+def _distributed_rank() -> int:
+    if _is_distributed_initialized():
+        return int(torch.distributed.get_rank())
+    raw = os.environ.get("RANK")
+    if raw and raw.isdigit():
+        return int(raw)
+    return 0
+
+
+def _distributed_world_size() -> int:
+    if _is_distributed_initialized():
+        return int(torch.distributed.get_world_size())
+    raw = os.environ.get("WORLD_SIZE")
+    if raw and raw.isdigit():
+        return int(raw)
+    return 1
+
+
+def _is_rank0() -> bool:
+    return _distributed_rank() == 0
+
+
+def _dist_barrier() -> None:
+    if _is_distributed_initialized():
+        torch.distributed.barrier()
+
+
+def _broadcast_object_list(payload: list[Any], src: int = 0) -> list[Any]:
+    if _is_distributed_initialized():
+        torch.distributed.broadcast_object_list(payload, src=src)
+    return payload
+
+
+def _local_rank_device(default_device: str) -> str:
+    local_rank_text = os.environ.get("LOCAL_RANK")
+    if local_rank_text and local_rank_text.isdigit() and torch.cuda.is_available():
+        local_rank = int(local_rank_text)
+        torch.cuda.set_device(local_rank)
+        return f"cuda:{local_rank}"
+    return default_device
+
+
+def _build_deepspeed_config_dict(cfg: RLPostTrainConfig, world_size: int) -> dict[str, Any]:
+    dtype_text = str(cfg.misc.dtype).strip().lower()
+    use_bf16 = dtype_text in {"bf16", "bfloat16"}
+    use_fp16 = dtype_text in {"fp16", "float16"}
+
+    micro_batch = max(1, int(cfg.rl.batch_size))
+    # GRPO update_policy already performs manual grad accumulation.
+    ds_grad_accum = 1
+    global_batch = micro_batch * ds_grad_accum * max(1, int(world_size))
+
+    zero_stage = int(cfg.rl.deepspeed_zero_stage)
+    zero_cfg: dict[str, Any] = {"stage": zero_stage}
+    if cfg.rl.deepspeed_offload_optimizer:
+        zero_cfg["offload_optimizer"] = {"device": "cpu", "pin_memory": True}
+    if cfg.rl.deepspeed_offload_param:
+        zero_cfg["offload_param"] = {"device": "cpu", "pin_memory": True}
+
+    ds_cfg: dict[str, Any] = {
+        "train_micro_batch_size_per_gpu": micro_batch,
+        "gradient_accumulation_steps": ds_grad_accum,
+        "train_batch_size": global_batch,
+        "zero_optimization": zero_cfg,
+        "bf16": {"enabled": bool(use_bf16)},
+        "fp16": {"enabled": bool(use_fp16 and not use_bf16)},
+    }
+    if cfg.rl.max_grad_norm > 0:
+        ds_cfg["gradient_clipping"] = float(cfg.rl.max_grad_norm)
+    ds_cfg["optimizer"] = {
+        "type": "AdamW",
+        "params": {
+            "lr": float(cfg.rl.lr),
+            "weight_decay": float(cfg.rl.weight_decay),
+            "betas": [0.9, 0.999],
+            "eps": float(cfg.rl.eps),
+        },
+    }
+    return ds_cfg
+
+
+def _load_deepspeed_config(cfg: RLPostTrainConfig, world_size: int) -> dict[str, Any]:
+    if cfg.rl.deepspeed_config_path:
+        path = Path(cfg.rl.deepspeed_config_path)
+        if not path.exists():
+            raise FileNotFoundError(f"rl.deepspeed_config_path not found: {path}")
+        text = path.read_text(encoding="utf-8")
+        if path.suffix.lower() in {".yaml", ".yml"}:
+            payload = yaml.safe_load(text)
+        else:
+            payload = json.loads(text)
+        if not isinstance(payload, dict):
+            raise ValueError(f"Invalid DeepSpeed config payload: {path}")
+        return payload
+    return _build_deepspeed_config_dict(cfg, world_size=world_size)
+
+
+def _deepspeed_initialize(
+    cfg: RLPostTrainConfig,
+    policy_model: AutoModelForCausalLM,
+) -> tuple[Any, Any]:
+    if deepspeed is None:
+        raise RuntimeError(
+            "rl.backend=deepspeed but `deepspeed` is not installed. "
+            "Install it and re-run."
+        )
+
+    world_size = _distributed_world_size()
+    if world_size > 1 and not _is_distributed_initialized():
+        deepspeed.init_distributed()
+
+    ds_config = _load_deepspeed_config(cfg, world_size=world_size)
+    engine, optimizer, _, _ = deepspeed.initialize(
+        model=policy_model,
+        model_parameters=[p for p in policy_model.parameters() if p.requires_grad],
+        config=ds_config,
+    )
+    return engine, optimizer
+
+
+def _unwrap_for_generation(model: Any) -> Any:
+    module = getattr(model, "module", None)
+    return module if module is not None else model
 
 
 def _parse_cuda_index(device: str | None) -> int | None:
@@ -446,19 +582,6 @@ def _resolve_model_dtype_and_attn(
     return dtype, None
 
 
-def _build_max_memory_map(device_ids: list[int]) -> dict[int | str, str]:
-    if not device_ids or torch is None or not torch.cuda.is_available():
-        return {}
-    max_memory: dict[int | str, str] = {}
-    for idx in device_ids:
-        total_bytes = int(torch.cuda.get_device_properties(idx).total_memory)
-        usable_bytes = int(total_bytes * 0.92)
-        gib = max(1, usable_bytes // (1024**3))
-        max_memory[idx] = f"{gib}GiB"
-    max_memory["cpu"] = "256GiB"
-    return max_memory
-
-
 def _load_causal_lm(
     model_name_or_path: str,
     kwargs: dict[str, Any],
@@ -471,25 +594,11 @@ def _load_causal_lm(
         model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **kwargs)
         model.to(single_device)
         return model
-
-    max_memory = _build_max_memory_map(explicit_gpu_ids)
-    mp_kwargs = dict(kwargs)
-    mp_kwargs["device_map"] = "auto"
-    if max_memory:
-        mp_kwargs["max_memory"] = max_memory
-
-    logger.info(
-        "Loading %s model with model-parallel device_map=auto on GPUs=%s",
-        component_name,
-        explicit_gpu_ids,
+    raise RuntimeError(
+        f"{component_name} model requested on multiple GPUs {explicit_gpu_ids}, "
+        "but device_map=auto path is disabled. "
+        "Use rl.backend=deepspeed for multi-GPU policy training, and keep reference model on a single GPU."
     )
-    try:
-        return AutoModelForCausalLM.from_pretrained(model_name_or_path, **mp_kwargs)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Failed to load {component_name} model with multi-GPU partition {explicit_gpu_ids}. "
-            "Check accelerate/transformers versions and model size."
-        ) from exc
 
 
 def _load_policy_model(
@@ -508,11 +617,12 @@ def _load_policy_model(
         kwargs["attn_implementation"] = attn_impl
 
     source = model_name_or_path or cfg.model.policy_name_or_path
+    policy_gpu_ids = [] if cfg.rl.backend == "deepspeed" else cfg.model.policy_gpu_ids
     return _load_causal_lm(
         model_name_or_path=source,
         kwargs=kwargs,
         single_device=device,
-        gpu_ids=cfg.model.policy_gpu_ids,
+        gpu_ids=policy_gpu_ids,
         component_name="policy",
     )
 
@@ -524,6 +634,13 @@ def _load_reference_model(cfg: RLPostTrainConfig, default_device: str) -> tuple[
     ref_name = cfg.model.reference_name_or_path or cfg.model.policy_name_or_path
     reference_gpu_ids = _normalize_gpu_id_list(cfg.model.reference_gpu_ids)
     if reference_gpu_ids:
+        if len(reference_gpu_ids) > 1:
+            logger.warning(
+                "reference_gpu_ids=%s requested, but multi-GPU reference loading is disabled. "
+                "Using only cuda:%s",
+                reference_gpu_ids,
+                reference_gpu_ids[0],
+            )
         ref_device = resolve_device(f"cuda:{reference_gpu_ids[0]}")
     else:
         ref_device = resolve_device(cfg.model.reference_device or default_device)
@@ -542,7 +659,7 @@ def _load_reference_model(cfg: RLPostTrainConfig, default_device: str) -> tuple[
         model_name_or_path=ref_name,
         kwargs=kwargs,
         single_device=ref_device,
-        gpu_ids=reference_gpu_ids,
+        gpu_ids=reference_gpu_ids[:1],
         component_name="reference",
     )
     model.eval()
@@ -863,6 +980,27 @@ def _save_checkpoint_to_dir(
     return ckpt_dir
 
 
+def _save_deepspeed_checkpoint_to_dir(
+    ckpt_dir: Path,
+    engine: Any,
+    tokenizer,
+    trainer_state: dict[str, Any] | None = None,
+) -> Path:
+    if _is_rank0():
+        if ckpt_dir.exists():
+            shutil.rmtree(ckpt_dir)
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+    _dist_barrier()
+    engine.save_checkpoint(str(ckpt_dir), tag="state")
+    _dist_barrier()
+    if _is_rank0():
+        tokenizer.save_pretrained(ckpt_dir)
+        if trainer_state:
+            _save_trainer_state(ckpt_dir, trainer_state)
+    _dist_barrier()
+    return ckpt_dir
+
+
 def _save_checkpoint(
     output_dir: Path,
     update_idx: int,
@@ -877,6 +1015,22 @@ def _save_checkpoint(
         model=model,
         tokenizer=tokenizer,
         optimizer=optimizer,
+        trainer_state=trainer_state,
+    )
+
+
+def _save_deepspeed_checkpoint(
+    output_dir: Path,
+    update_idx: int,
+    engine: Any,
+    tokenizer,
+    trainer_state: dict[str, Any] | None = None,
+) -> Path:
+    ckpt_dir = output_dir / f"checkpoint-{update_idx}"
+    return _save_deepspeed_checkpoint_to_dir(
+        ckpt_dir=ckpt_dir,
+        engine=engine,
+        tokenizer=tokenizer,
         trainer_state=trainer_state,
     )
 
@@ -897,6 +1051,24 @@ def _save_resume_checkpoint(
         model=model,
         tokenizer=tokenizer,
         optimizer=optimizer,
+        trainer_state=state,
+    )
+
+
+def _save_deepspeed_resume_checkpoint(
+    output_dir: Path,
+    update_idx: int,
+    engine: Any,
+    tokenizer,
+    trainer_state: dict[str, Any] | None = None,
+) -> Path:
+    ckpt_dir = output_dir / "resume_latest"
+    state = dict(trainer_state or {})
+    state["update_idx"] = int(update_idx)
+    return _save_deepspeed_checkpoint_to_dir(
+        ckpt_dir=ckpt_dir,
+        engine=engine,
+        tokenizer=tokenizer,
         trainer_state=state,
     )
 
@@ -990,11 +1162,25 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     )
     configure_huggingface_cache(cfg.misc.huggingface_cache_dir, token=hf_token)
     _assign_disjoint_gpu_devices(cfg)
-    device = resolve_device(cfg.misc.device)
+    use_deepspeed = cfg.rl.backend == "deepspeed"
+    if use_deepspeed and _distributed_world_size() > 1 and not _is_distributed_initialized():
+        if deepspeed is None:
+            raise RuntimeError(
+                "rl.backend=deepspeed but deepspeed is not installed. Install it first."
+            )
+        deepspeed.init_distributed()
+
+    base_device = resolve_device(cfg.misc.device)
+    if use_deepspeed:
+        base_device = _local_rank_device(base_device)
+    device = base_device
+    rank0 = _is_rank0()
 
     output_dir = Path(cfg.logging.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    dump_config(cfg, output_dir / "resolved_config.yaml")
+    if rank0:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        dump_config(cfg, output_dir / "resolved_config.yaml")
+    _dist_barrier()
 
     log_path = output_dir / cfg.logging.jsonl_name
     rollout_log_path = output_dir / cfg.logging.rollout_jsonl_name
@@ -1010,18 +1196,20 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     is_resuming = resume_ckpt is not None
     start_update = resume_update_idx + 1 if is_resuming else 1
 
-    if log_path.exists() and not is_resuming:
-        log_path.unlink()
-    if cfg.logging.save_rollouts and rollout_log_path.exists() and not is_resuming:
-        rollout_log_path.unlink()
-    if cfg.logging.save_eval_outputs and eval_output_path.exists() and not is_resuming:
-        eval_output_path.unlink()
-    if is_resuming:
-        _truncate_jsonl_by_update(log_path, resume_update_idx)
-        if cfg.logging.save_rollouts:
-            _truncate_jsonl_by_update(rollout_log_path, resume_update_idx)
-        if cfg.logging.save_eval_outputs:
-            _truncate_jsonl_by_update(eval_output_path, resume_update_idx)
+    if rank0:
+        if log_path.exists() and not is_resuming:
+            log_path.unlink()
+        if cfg.logging.save_rollouts and rollout_log_path.exists() and not is_resuming:
+            rollout_log_path.unlink()
+        if cfg.logging.save_eval_outputs and eval_output_path.exists() and not is_resuming:
+            eval_output_path.unlink()
+        if is_resuming:
+            _truncate_jsonl_by_update(log_path, resume_update_idx)
+            if cfg.logging.save_rollouts:
+                _truncate_jsonl_by_update(rollout_log_path, resume_update_idx)
+            if cfg.logging.save_eval_outputs:
+                _truncate_jsonl_by_update(eval_output_path, resume_update_idx)
+    _dist_barrier()
 
     tokenizer_name = cfg.model.tokenizer_name_or_path or cfg.model.policy_name_or_path
     tokenizer_source = (
@@ -1033,9 +1221,22 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    policy_source = str(resume_ckpt) if resume_ckpt is not None else cfg.model.policy_name_or_path
+    if use_deepspeed:
+        # DeepSpeed checkpoints are restored via engine.load_checkpoint(), not HF from_pretrained().
+        policy_source = cfg.model.policy_name_or_path
+    else:
+        policy_source = str(resume_ckpt) if resume_ckpt is not None else cfg.model.policy_name_or_path
     policy_model = _load_policy_model(cfg, device=device, model_name_or_path=policy_source)
-    ref_model, ref_device = _load_reference_model(cfg, default_device=device)
+    train_model: Any = policy_model
+    optimizer: torch.optim.Optimizer | None = None
+    if use_deepspeed:
+        train_model, _ = _deepspeed_initialize(cfg, policy_model)
+    policy_eval_model = _unwrap_for_generation(train_model)
+
+    ref_model: AutoModelForCausalLM | None = None
+    ref_device: str | None = None
+    if (not use_deepspeed) or rank0:
+        ref_model, ref_device = _load_reference_model(cfg, default_device=device)
 
     train_examples = load_examples(cfg.data, split="train", limit=cfg.data.limit)
     if not train_examples:
@@ -1070,23 +1271,43 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     if not (cfg.reward.mqm.target_lang or "").strip():
         cfg.reward.mqm.target_lang = cfg.data.default_tgt_lang
 
-    metricx_scorer = MetricXQEScorer(cfg.reward.metricx) if cfg.reward.metricx.enabled else None
-    xcomet_scorer = XCometXLScorer(cfg.reward.xcomet) if cfg.reward.xcomet.enabled else None
-    mqm_scorer = OpenAICompatibleMQMScorer(cfg.reward.mqm) if cfg.reward.mqm.enabled else None
-
-    optimizer = torch.optim.AdamW(
-        [p for p in policy_model.parameters() if p.requires_grad],
-        lr=cfg.rl.lr,
-        weight_decay=cfg.rl.weight_decay,
+    metricx_scorer = (
+        MetricXQEScorer(cfg.reward.metricx) if cfg.reward.metricx.enabled and ((not use_deepspeed) or rank0) else None
+    )
+    xcomet_scorer = (
+        XCometXLScorer(cfg.reward.xcomet) if cfg.reward.xcomet.enabled and ((not use_deepspeed) or rank0) else None
+    )
+    mqm_scorer = (
+        OpenAICompatibleMQMScorer(cfg.reward.mqm)
+        if cfg.reward.mqm.enabled and ((not use_deepspeed) or rank0)
+        else None
     )
 
-    if is_resuming:
-        optimizer_path = resume_ckpt / "optimizer.pt"
-        if optimizer_path.exists():
-            optimizer_state = torch.load(optimizer_path, map_location="cpu")
-            optimizer.load_state_dict(optimizer_state)
-        else:
-            logger.warning("Resume checkpoint has no optimizer.pt: %s", resume_ckpt)
+    if not use_deepspeed:
+        optimizer = torch.optim.AdamW(
+            [p for p in policy_model.parameters() if p.requires_grad],
+            lr=cfg.rl.lr,
+            weight_decay=cfg.rl.weight_decay,
+        )
+        if is_resuming:
+            optimizer_path = resume_ckpt / "optimizer.pt"
+            if optimizer_path.exists():
+                optimizer_state = torch.load(optimizer_path, map_location="cpu")
+                optimizer.load_state_dict(optimizer_state)
+            else:
+                logger.warning("Resume checkpoint has no optimizer.pt: %s", resume_ckpt)
+    elif is_resuming and resume_ckpt is not None:
+        try:
+            load_path, _ = train_model.load_checkpoint(
+                str(resume_ckpt),
+                tag="state",
+                load_optimizer_states=True,
+                load_lr_scheduler_states=False,
+            )
+            if load_path is None and rank0:
+                logger.warning("DeepSpeed resume checkpoint could not be loaded from %s", resume_ckpt)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load DeepSpeed checkpoint from {resume_ckpt}") from exc
 
     artifacts: dict[str, Any] = {
         "output_dir": str(output_dir),
@@ -1140,28 +1361,30 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         )
 
     if cfg.eval.run_before_train and eval_examples and start_update <= 1:
-        report = evaluate_on_dataset(
-            examples=eval_examples,
-            policy_model=policy_model,
-            tokenizer=tokenizer,
-            cfg=cfg,
-            device=device,
-            metricx_scorer=metricx_scorer,
-            xcomet_scorer=xcomet_scorer,
-            mqm_scorer=mqm_scorer,
-            collect_outputs=cfg.logging.save_eval_outputs,
-        )
-        eval_select_score = _compute_eval_selection_score(report, cfg)
-        report["model_select_score"] = eval_select_score
-        eval_rows = report.pop("eval_rows", [])
-        _append_jsonl(log_path, {"type": "eval", "update": 0, **report})
-        if cfg.logging.save_eval_outputs:
-            _append_eval_output_jsonl(eval_output_path, update_idx=0, eval_rows=eval_rows)
-        if math.isfinite(eval_select_score) and eval_select_score > best_eval_score:
-            _save_model_only(best_dir, policy_model, tokenizer)
-            best_eval_score = eval_select_score
-            best_eval_update = 0
-            logger.info("new best eval at update=%s score=%.6f", 0, eval_select_score)
+        if (not use_deepspeed) or rank0:
+            report = evaluate_on_dataset(
+                examples=eval_examples,
+                policy_model=policy_eval_model,
+                tokenizer=tokenizer,
+                cfg=cfg,
+                device=device,
+                metricx_scorer=metricx_scorer,
+                xcomet_scorer=xcomet_scorer,
+                mqm_scorer=mqm_scorer,
+                collect_outputs=cfg.logging.save_eval_outputs,
+            )
+            eval_select_score = _compute_eval_selection_score(report, cfg)
+            report["model_select_score"] = eval_select_score
+            eval_rows = report.pop("eval_rows", [])
+            _append_jsonl(log_path, {"type": "eval", "update": 0, **report})
+            if cfg.logging.save_eval_outputs:
+                _append_eval_output_jsonl(eval_output_path, update_idx=0, eval_rows=eval_rows)
+            if math.isfinite(eval_select_score) and eval_select_score > best_eval_score:
+                _save_model_only(best_dir, policy_eval_model, tokenizer)
+                best_eval_score = eval_select_score
+                best_eval_update = 0
+                logger.info("new best eval at update=%s score=%.6f", 0, eval_select_score)
+        _dist_barrier()
     elif cfg.eval.run_before_train and eval_examples and start_update > 1:
         logger.info(
             "Skipping run_before_train eval because training is resumed from update=%s.",
@@ -1192,37 +1415,53 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         )
 
     for update_idx in range(start_update, cfg.rl.updates + 1):
-        if train_cursor >= len(train_indices):
-            rng.shuffle(train_indices)
-            train_cursor = 0
-        batch_end = min(train_cursor + max(1, cfg.rl.batch_size), len(train_indices))
-        batch_indices = train_indices[train_cursor:batch_end]
-        train_cursor = batch_end
-        batch_examples = [train_examples[i] for i in batch_indices]
-        rollouts = generate_rollouts(
-            examples=batch_examples,
-            policy_model=policy_model,
-            tokenizer=tokenizer,
-            gen_cfg=cfg.generation,
-            device=device,
-            ref_model=ref_model,
-            ref_device=ref_device,
-            prompt_template=cfg.prompt.template,
-        )
-        if not rollouts:
-            logger.warning("No rollouts generated at update=%s; skipping step.", update_idx)
-            continue
+        rollouts: list[Rollout] = []
+        advantages: list[list[float]] = []
+        reward_stats: dict[str, float] = {}
+        adv_stats: dict[str, float] = {}
+        if (not use_deepspeed) or rank0:
+            if train_cursor >= len(train_indices):
+                rng.shuffle(train_indices)
+                train_cursor = 0
+            batch_end = min(train_cursor + max(1, cfg.rl.batch_size), len(train_indices))
+            batch_indices = train_indices[train_cursor:batch_end]
+            train_cursor = batch_end
+            batch_examples = [train_examples[i] for i in batch_indices]
+            rollouts = generate_rollouts(
+                examples=batch_examples,
+                policy_model=policy_eval_model,
+                tokenizer=tokenizer,
+                gen_cfg=cfg.generation,
+                device=device,
+                ref_model=ref_model,
+                ref_device=ref_device,
+                prompt_template=cfg.prompt.template,
+            )
+            if rollouts:
+                advantages, reward_stats, adv_stats = _prepare_rewards_and_advantages(
+                    rollouts=rollouts,
+                    cfg=cfg,
+                    metricx_scorer=metricx_scorer,
+                    xcomet_scorer=xcomet_scorer,
+                    mqm_scorer=mqm_scorer,
+                    metricx_cache=metricx_cache,
+                    xcomet_cache=xcomet_cache,
+                    mqm_cache=mqm_cache,
+                )
+            else:
+                logger.warning("No rollouts generated at update=%s; skipping step.", update_idx)
 
-        advantages, reward_stats, adv_stats = _prepare_rewards_and_advantages(
-            rollouts=rollouts,
-            cfg=cfg,
-            metricx_scorer=metricx_scorer,
-            xcomet_scorer=xcomet_scorer,
-            mqm_scorer=mqm_scorer,
-            metricx_cache=metricx_cache,
-            xcomet_cache=xcomet_cache,
-            mqm_cache=mqm_cache,
-        )
+        if use_deepspeed and _distributed_world_size() > 1:
+            shared: list[Any] = [rollouts, advantages, reward_stats, adv_stats]
+            _broadcast_object_list(shared, src=0)
+            rollouts = shared[0] or []
+            advantages = shared[1] or []
+            reward_stats = shared[2] or {}
+            adv_stats = shared[3] or {}
+
+        if not rollouts:
+            _dist_barrier()
+            continue
 
         step_stats = []
         for _ in range(max(1, cfg.rl.ppo_epochs)):
@@ -1230,7 +1469,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 update_policy(
                     rollouts=rollouts,
                     advantages=advantages,
-                    policy_model=policy_model,
+                    policy_model=train_model,
                     optimizer=optimizer,
                     rl_cfg=cfg.rl,
                     device=device,
@@ -1255,33 +1494,34 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             "token_count": train_stats.token_count,
             **reward_stats,
         }
-        _append_jsonl(log_path, payload)
-        if cfg.logging.save_rollouts:
-            _append_rollout_jsonl(
-                path=rollout_log_path,
-                update_idx=update_idx,
-                rollouts=rollouts,
-                advantages=advantages,
-                reward_stats=reward_stats,
-            )
+        if (not use_deepspeed) or rank0:
+            _append_jsonl(log_path, payload)
+            if cfg.logging.save_rollouts:
+                _append_rollout_jsonl(
+                    path=rollout_log_path,
+                    update_idx=update_idx,
+                    rollouts=rollouts,
+                    advantages=advantages,
+                    reward_stats=reward_stats,
+                )
 
-        logger.info(
-            "update=%s loss=%.6f len=%.2f metricx=%.4f±%.4f xcomet=%.4f±%.4f mqm=%.4f±%.4f token_nonzero=%.4f A(raw)=%.4f/%.4f A(norm)=%.4f/%.4f",
-            update_idx,
-            train_stats.policy_loss,
-            payload["rollout_avg_completion_len"],
-            payload["metricx_score_mean"],
-            payload["metricx_score_std"],
-            payload["xcomet_score_mean"],
-            payload["xcomet_score_std"],
-            payload["mqm_score_mean"],
-            payload["mqm_score_std"],
-            payload["token_rewards_non_zero_ratio"],
-            payload["adv_raw_mean"],
-            payload["adv_raw_std"],
-            payload["adv_norm_mean"],
-            payload["adv_norm_std"],
-        )
+            logger.info(
+                "update=%s loss=%.6f len=%.2f metricx=%.4f±%.4f xcomet=%.4f±%.4f mqm=%.4f±%.4f token_nonzero=%.4f A(raw)=%.4f/%.4f A(norm)=%.4f/%.4f",
+                update_idx,
+                train_stats.policy_loss,
+                payload["rollout_avg_completion_len"],
+                payload["metricx_score_mean"],
+                payload["metricx_score_std"],
+                payload["xcomet_score_mean"],
+                payload["xcomet_score_std"],
+                payload["mqm_score_mean"],
+                payload["mqm_score_std"],
+                payload["token_rewards_non_zero_ratio"],
+                payload["adv_raw_mean"],
+                payload["adv_raw_std"],
+                payload["adv_norm_mean"],
+                payload["adv_norm_std"],
+            )
 
         trainer_state_payload = {
             "update_idx": int(update_idx),
@@ -1290,76 +1530,111 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         }
 
         if cfg.logging.save_every_n_updates > 0 and update_idx % cfg.logging.save_every_n_updates == 0:
-            if cfg.logging.save_only_best:
-                resume_path = _save_resume_checkpoint(
-                    output_dir=output_dir,
-                    update_idx=update_idx,
-                    model=policy_model,
-                    tokenizer=tokenizer,
-                    optimizer=optimizer,
-                    trainer_state=trainer_state_payload,
-                )
-                artifacts["resume_checkpoint"] = str(resume_path)
-            else:
-                ckpt = _save_checkpoint(
-                    output_dir=output_dir,
-                    update_idx=update_idx,
-                    model=policy_model,
-                    tokenizer=tokenizer,
-                    optimizer=optimizer,
-                    trainer_state=trainer_state_payload,
-                )
-                artifacts["checkpoints"].append(str(ckpt))
+            if use_deepspeed:
+                if cfg.logging.save_only_best:
+                    resume_path = _save_deepspeed_resume_checkpoint(
+                        output_dir=output_dir,
+                        update_idx=update_idx,
+                        engine=train_model,
+                        tokenizer=tokenizer,
+                        trainer_state=trainer_state_payload,
+                    )
+                    if rank0:
+                        artifacts["resume_checkpoint"] = str(resume_path)
+                else:
+                    ckpt = _save_deepspeed_checkpoint(
+                        output_dir=output_dir,
+                        update_idx=update_idx,
+                        engine=train_model,
+                        tokenizer=tokenizer,
+                        trainer_state=trainer_state_payload,
+                    )
+                    if rank0:
+                        artifacts["checkpoints"].append(str(ckpt))
+            elif rank0:
+                if cfg.logging.save_only_best:
+                    assert optimizer is not None
+                    resume_path = _save_resume_checkpoint(
+                        output_dir=output_dir,
+                        update_idx=update_idx,
+                        model=policy_eval_model,
+                        tokenizer=tokenizer,
+                        optimizer=optimizer,
+                        trainer_state=trainer_state_payload,
+                    )
+                    artifacts["resume_checkpoint"] = str(resume_path)
+                else:
+                    assert optimizer is not None
+                    ckpt = _save_checkpoint(
+                        output_dir=output_dir,
+                        update_idx=update_idx,
+                        model=policy_eval_model,
+                        tokenizer=tokenizer,
+                        optimizer=optimizer,
+                        trainer_state=trainer_state_payload,
+                    )
+                    artifacts["checkpoints"].append(str(ckpt))
 
         if (
             cfg.eval.eval_every_n_updates > 0
             and eval_examples
             and update_idx % cfg.eval.eval_every_n_updates == 0
         ):
-            report = evaluate_on_dataset(
-                examples=eval_examples,
-                policy_model=policy_model,
-                tokenizer=tokenizer,
-                cfg=cfg,
-                device=device,
-                metricx_scorer=metricx_scorer,
-                xcomet_scorer=xcomet_scorer,
-                mqm_scorer=mqm_scorer,
-                collect_outputs=cfg.logging.save_eval_outputs,
-            )
-            eval_select_score = _compute_eval_selection_score(report, cfg)
-            report["model_select_score"] = eval_select_score
-            eval_rows = report.pop("eval_rows", [])
-            _append_jsonl(log_path, {"type": "eval", "update": update_idx, **report})
-            if cfg.logging.save_eval_outputs:
-                _append_eval_output_jsonl(eval_output_path, update_idx=update_idx, eval_rows=eval_rows)
-            if math.isfinite(eval_select_score) and eval_select_score > best_eval_score:
-                _save_model_only(best_dir, policy_model, tokenizer)
-                best_eval_score = eval_select_score
-                best_eval_update = update_idx
-                logger.info("new best eval at update=%s score=%.6f", update_idx, eval_select_score)
+            if (not use_deepspeed) or rank0:
+                report = evaluate_on_dataset(
+                    examples=eval_examples,
+                    policy_model=policy_eval_model,
+                    tokenizer=tokenizer,
+                    cfg=cfg,
+                    device=device,
+                    metricx_scorer=metricx_scorer,
+                    xcomet_scorer=xcomet_scorer,
+                    mqm_scorer=mqm_scorer,
+                    collect_outputs=cfg.logging.save_eval_outputs,
+                )
+                eval_select_score = _compute_eval_selection_score(report, cfg)
+                report["model_select_score"] = eval_select_score
+                eval_rows = report.pop("eval_rows", [])
+                _append_jsonl(log_path, {"type": "eval", "update": update_idx, **report})
+                if cfg.logging.save_eval_outputs:
+                    _append_eval_output_jsonl(eval_output_path, update_idx=update_idx, eval_rows=eval_rows)
+                if math.isfinite(eval_select_score) and eval_select_score > best_eval_score:
+                    _save_model_only(best_dir, policy_eval_model, tokenizer)
+                    best_eval_score = eval_select_score
+                    best_eval_update = update_idx
+                    logger.info("new best eval at update=%s score=%.6f", update_idx, eval_select_score)
 
         # Early-stop guard for divergence in toy runs.
         if not math.isfinite(train_stats.policy_loss):
             raise RuntimeError(f"Non-finite loss at update {update_idx}")
+        _dist_barrier()
 
-    final_dir = output_dir / "final"
-    if final_dir.exists():
-        shutil.rmtree(final_dir)
-    if best_eval_update is not None and best_dir.exists():
-        shutil.copytree(best_dir, final_dir)
-    else:
-        final_dir.mkdir(parents=True, exist_ok=True)
-        policy_model.save_pretrained(final_dir)
-        tokenizer.save_pretrained(final_dir)
-    artifacts["final_model_dir"] = str(final_dir)
-    artifacts["best_model_dir"] = str(best_dir) if best_eval_update is not None and best_dir.exists() else None
-    artifacts["best_eval_update"] = best_eval_update
-    artifacts["best_eval_score"] = best_eval_score if best_eval_update is not None else None
-    artifacts["log_path"] = str(log_path)
-    if cfg.logging.save_rollouts:
-        artifacts["rollout_log_path"] = str(rollout_log_path)
-    if cfg.logging.save_eval_outputs:
-        artifacts["eval_output_path"] = str(eval_output_path)
+    if (not use_deepspeed) or rank0:
+        final_dir = output_dir / "final"
+        if final_dir.exists():
+            shutil.rmtree(final_dir)
+        if best_eval_update is not None and best_dir.exists():
+            shutil.copytree(best_dir, final_dir)
+        else:
+            final_dir.mkdir(parents=True, exist_ok=True)
+            policy_eval_model.save_pretrained(final_dir)
+            tokenizer.save_pretrained(final_dir)
+        artifacts["final_model_dir"] = str(final_dir)
+        artifacts["best_model_dir"] = str(best_dir) if best_eval_update is not None and best_dir.exists() else None
+        artifacts["best_eval_update"] = best_eval_update
+        artifacts["best_eval_score"] = best_eval_score if best_eval_update is not None else None
+        artifacts["log_path"] = str(log_path)
+        if cfg.logging.save_rollouts:
+            artifacts["rollout_log_path"] = str(rollout_log_path)
+        if cfg.logging.save_eval_outputs:
+            artifacts["eval_output_path"] = str(eval_output_path)
+    _dist_barrier()
+
+    if use_deepspeed and (not rank0):
+        return {
+            "output_dir": str(output_dir),
+            "worker_rank": _distributed_rank(),
+            "status": "ok",
+        }
 
     return artifacts

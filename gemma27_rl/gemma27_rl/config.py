@@ -151,6 +151,7 @@ class RewardConfig:
 
 @dataclass
 class RLConfig:
+    backend: str = "native"  # native|deepspeed
     algorithm: str = "grpo"  # grpo|reinforce
     lr: float = 1e-6
     weight_decay: float = 0.0
@@ -166,6 +167,10 @@ class RLConfig:
     group_normalize: bool = True
     group_advantage_coef: float = 1.0
     eps: float = 1e-8
+    deepspeed_config_path: str | None = None
+    deepspeed_zero_stage: int = 2
+    deepspeed_offload_optimizer: bool = False
+    deepspeed_offload_param: bool = False
 
 
 @dataclass
@@ -309,6 +314,10 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("rl.updates must be > 0")
     if cfg.rl.algorithm not in {"grpo", "reinforce"}:
         raise ValueError("rl.algorithm must be one of: grpo, reinforce")
+    if cfg.rl.backend not in {"native", "deepspeed"}:
+        raise ValueError("rl.backend must be native|deepspeed")
+    if int(cfg.rl.deepspeed_zero_stage) not in {0, 1, 2, 3}:
+        raise ValueError("rl.deepspeed_zero_stage must be one of 0,1,2,3")
     if cfg.generation.chat_template_kwargs is not None and not isinstance(cfg.generation.chat_template_kwargs, dict):
         raise ValueError("generation.chat_template_kwargs must be a dict")
     if cfg.reward.overlap_policy not in {"any_overlap", "majority_overlap"}:
@@ -345,6 +354,17 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
 
     cfg.model.policy_gpu_ids = _normalize_gpu_ids(cfg.model.policy_gpu_ids, "model.policy_gpu_ids")
     cfg.model.reference_gpu_ids = _normalize_gpu_ids(cfg.model.reference_gpu_ids, "model.reference_gpu_ids")
+
+    if cfg.rl.backend != "deepspeed":
+        if len(cfg.model.policy_gpu_ids) > 1:
+            raise ValueError(
+                "model.policy_gpu_ids with length > 1 requires rl.backend=deepspeed "
+                "(device_map=auto path is disabled)."
+            )
+        if len(cfg.model.reference_gpu_ids) > 1:
+            raise ValueError(
+                "model.reference_gpu_ids with length > 1 is not supported without deepspeed."
+            )
 
     policy_set = set(cfg.model.policy_gpu_ids)
     ref_set = set(cfg.model.reference_gpu_ids)
@@ -390,6 +410,7 @@ def load_config(path: str | Path) -> RLPostTrainConfig:
     cfg.logging.output_dir = _resolve_optional_path(cfg.logging.output_dir, base_dir) or cfg.logging.output_dir
     cfg.logging.resume_from_checkpoint = _resolve_optional_path(cfg.logging.resume_from_checkpoint, base_dir)
     cfg.misc.huggingface_cache_dir = _resolve_optional_path(cfg.misc.huggingface_cache_dir, base_dir)
+    cfg.rl.deepspeed_config_path = _resolve_optional_path(cfg.rl.deepspeed_config_path, base_dir)
 
     _validate_config(cfg)
     return cfg
