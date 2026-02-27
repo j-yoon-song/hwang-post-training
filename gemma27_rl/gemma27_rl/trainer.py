@@ -24,6 +24,7 @@ from .data import load_examples
 from .eval import evaluate_on_dataset
 from .grpo import update_policy
 from .rewards import (
+    OpenAICompatibleMQMScorer,
     MetricXQEScorer,
     XCometXLScorer,
     metricx_score_to_reward,
@@ -224,6 +225,41 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def _truncate_jsonl_by_update(path: Path, max_update: int) -> None:
+    if not path.exists():
+        return
+
+    kept: list[str] = []
+    dropped = 0
+    with path.open("r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.rstrip("\n")
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                kept.append(line + "\n")
+                continue
+            if not isinstance(row, dict) or "update" not in row:
+                kept.append(line + "\n")
+                continue
+            try:
+                update_idx = int(row["update"])
+            except (TypeError, ValueError):
+                kept.append(line + "\n")
+                continue
+            if update_idx <= max_update:
+                kept.append(line + "\n")
+            else:
+                dropped += 1
+
+    if dropped > 0:
+        with path.open("w", encoding="utf-8") as f:
+            f.writelines(kept)
+        logger.info("Truncated %s rows from %s for resume consistency.", dropped, path)
+
+
 def _append_rollout_jsonl(
     path: Path,
     update_idx: int,
@@ -252,6 +288,7 @@ def _append_rollout_jsonl(
             else None,
             "metricx_score_mean_batch": reward_stats.get("metricx_score_mean", 0.0),
             "xcomet_score_mean_batch": reward_stats.get("xcomet_score_mean", 0.0),
+            "mqm_score_mean_batch": reward_stats.get("mqm_score_mean", 0.0),
             "token_rewards_non_zero_ratio_batch": reward_stats.get("token_rewards_non_zero_ratio", 0.0),
         }
         _append_jsonl(path, payload)
@@ -266,6 +303,113 @@ def _append_eval_output_jsonl(path: Path, update_idx: int, eval_rows: list[dict[
             **row,
         }
         _append_jsonl(path, payload)
+
+
+def _parse_checkpoint_update_idx(path: Path) -> int | None:
+    name = path.name.strip()
+    prefix = "checkpoint-"
+    if not name.startswith(prefix):
+        return None
+    idx_text = name[len(prefix) :]
+    if not idx_text.isdigit():
+        return None
+    return int(idx_text)
+
+
+def _save_trainer_state(path: Path, payload: dict[str, Any]) -> None:
+    state_path = path / "trainer_state.json"
+    state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_trainer_state(path: Path) -> dict[str, Any] | None:
+    state_path = path / "trainer_state.json"
+    if not state_path.exists():
+        return None
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Failed to read trainer_state.json from %s: %s", path, exc)
+        return None
+    if not isinstance(payload, dict):
+        logger.warning("Invalid trainer_state.json format at %s", path)
+        return None
+    return payload
+
+
+def _restore_best_from_log(log_path: Path) -> tuple[float, int | None]:
+    if not log_path.exists():
+        return float("-inf"), None
+
+    best_score = float("-inf")
+    best_update: int | None = None
+    with log_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                row = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            if row.get("type") != "eval":
+                continue
+            score_raw = row.get("model_select_score")
+            update_raw = row.get("update")
+            try:
+                score = float(score_raw)
+                update = int(update_raw)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(score):
+                continue
+            if score > best_score:
+                best_score = score
+                best_update = update
+    return best_score, best_update
+
+
+def _resolve_resume_checkpoint(
+    cfg: RLPostTrainConfig,
+    output_dir: Path,
+) -> tuple[Path | None, int]:
+    explicit = cfg.logging.resume_from_checkpoint
+    if explicit:
+        resume_path = Path(explicit)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"logging.resume_from_checkpoint not found: {resume_path}")
+        state = _load_trainer_state(resume_path) or {}
+        update_idx = int(state.get("update_idx", _parse_checkpoint_update_idx(resume_path) or 0))
+        return resume_path, update_idx
+
+    if not cfg.logging.auto_resume:
+        return None, 0
+
+    candidates: list[tuple[int, Path]] = []
+    resume_latest = output_dir / "resume_latest"
+    if resume_latest.exists() and resume_latest.is_dir():
+        state = _load_trainer_state(resume_latest) or {}
+        update_raw = state.get("update_idx")
+        try:
+            update_idx = int(update_raw)
+        except (TypeError, ValueError):
+            update_idx = 0
+        candidates.append((update_idx, resume_latest))
+
+    for path in output_dir.glob("checkpoint-*"):
+        if not path.is_dir():
+            continue
+        update_idx = _parse_checkpoint_update_idx(path)
+        if update_idx is None:
+            continue
+        candidates.append((update_idx, path))
+
+    if not candidates:
+        return None, 0
+
+    update_idx, resume_path = max(candidates, key=lambda item: item[0])
+    return resume_path, update_idx
 
 
 def _resolve_model_dtype_and_attn(
@@ -348,7 +492,11 @@ def _load_causal_lm(
         ) from exc
 
 
-def _load_policy_model(cfg: RLPostTrainConfig, device: str) -> AutoModelForCausalLM:
+def _load_policy_model(
+    cfg: RLPostTrainConfig,
+    device: str,
+    model_name_or_path: str | None = None,
+) -> AutoModelForCausalLM:
     dtype, attn_impl = _resolve_model_dtype_and_attn(cfg, device)
 
     kwargs: dict[str, Any] = {
@@ -359,8 +507,9 @@ def _load_policy_model(cfg: RLPostTrainConfig, device: str) -> AutoModelForCausa
     if attn_impl:
         kwargs["attn_implementation"] = attn_impl
 
+    source = model_name_or_path or cfg.model.policy_name_or_path
     return _load_causal_lm(
-        model_name_or_path=cfg.model.policy_name_or_path,
+        model_name_or_path=source,
         kwargs=kwargs,
         single_device=device,
         gpu_ids=cfg.model.policy_gpu_ids,
@@ -475,13 +624,43 @@ def _score_with_cache_xcomet(
     return scores, spans
 
 
+def _score_with_cache_mqm(
+    samples: list[SampleForScoring],
+    scorer: OpenAICompatibleMQMScorer,
+    cache: dict[tuple[str, str, str], float],
+    use_cache: bool,
+) -> list[float]:
+    out = [0.0 for _ in samples]
+    uncached: list[SampleForScoring] = []
+    uncached_idx: list[int] = []
+
+    for idx, sample in enumerate(samples):
+        key = (sample.src, sample.mt, (sample.ref or "") if scorer.cfg.use_reference else "")
+        if use_cache and key in cache:
+            out[idx] = cache[key]
+        else:
+            uncached.append(sample)
+            uncached_idx.append(idx)
+
+    if uncached:
+        scores = scorer.score_batch(uncached).sequence_scores
+        for idx, score, sample in zip(uncached_idx, scores, uncached):
+            out[idx] = float(score)
+            if use_cache:
+                cache[(sample.src, sample.mt, (sample.ref or "") if scorer.cfg.use_reference else "")] = float(score)
+
+    return out
+
+
 def _prepare_rewards_and_advantages(
     rollouts: list[Rollout],
     cfg: RLPostTrainConfig,
     metricx_scorer: MetricXQEScorer | None,
     xcomet_scorer: XCometXLScorer | None,
+    mqm_scorer: OpenAICompatibleMQMScorer | None,
     metricx_cache: dict[tuple[str, str, str], float],
     xcomet_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]],
+    mqm_cache: dict[tuple[str, str, str], float],
 ) -> tuple[list[list[float]], dict[str, float], dict[str, float]]:
     def _sanitize(values: list[float], fallback: float) -> tuple[list[float], int]:
         out: list[float] = []
@@ -539,6 +718,22 @@ def _prepare_rewards_and_advantages(
             xcomet_replaced,
         )
 
+    if cfg.reward.mqm.enabled and mqm_scorer is not None:
+        mqm_scores = _score_with_cache_mqm(
+            samples=samples,
+            scorer=mqm_scorer,
+            cache=mqm_cache,
+            use_cache=cfg.reward.cache_enabled and cfg.reward.mqm.enabled,
+        )
+    else:
+        mqm_scores = [0.0 for _ in rollouts]
+    mqm_scores, mqm_replaced = _sanitize(mqm_scores, fallback=0.0)
+    if mqm_replaced > 0:
+        logger.warning(
+            "MQM scorer produced %s non-finite scores; replaced with fallback 0.0.",
+            mqm_replaced,
+        )
+
     seq_rewards = build_sequence_rewards(
         metricx_scores=metricx_scores,
         xcomet_scores=xcomet_scores,
@@ -546,6 +741,9 @@ def _prepare_rewards_and_advantages(
         w_metricx=cfg.reward.w_metricx,
         w_xcomet_seq=cfg.reward.w_xcomet_seq,
         xcomet_seq_scale=cfg.reward.xcomet_seq_scale,
+        mqm_scores=mqm_scores,
+        w_mqm_seq=cfg.reward.w_mqm_seq,
+        mqm_seq_scale=cfg.reward.mqm_seq_scale,
     )
 
     token_reward_rows: list[list[float]] = []
@@ -609,6 +807,7 @@ def _prepare_rewards_and_advantages(
     metricx_m, metricx_s = _mean_std(metricx_scores)
     metricx_r_m, metricx_r_s = _mean_std(metricx_rewards)
     xcomet_m, xcomet_s = _mean_std(xcomet_scores)
+    mqm_m, mqm_s = _mean_std(mqm_scores)
 
     reward_stats = {
         "metricx_score_mean": metricx_m,
@@ -617,6 +816,8 @@ def _prepare_rewards_and_advantages(
         "metricx_reward_std": metricx_r_s,
         "xcomet_score_mean": xcomet_m,
         "xcomet_score_std": xcomet_s,
+        "mqm_score_mean": mqm_m,
+        "mqm_score_std": mqm_s,
         "token_rewards_mean": token_reward_m,
         "token_rewards_std": token_reward_s,
         "token_rewards_non_zero_ratio": float(non_zero_token_ratio),
@@ -628,19 +829,60 @@ def _prepare_rewards_and_advantages(
     return norm_adv_rows, reward_stats, norm_stats
 
 
+def _save_checkpoint_to_dir(
+    ckpt_dir: Path,
+    model: AutoModelForCausalLM,
+    tokenizer,
+    optimizer: torch.optim.Optimizer,
+    trainer_state: dict[str, Any] | None = None,
+) -> Path:
+    if ckpt_dir.exists():
+        shutil.rmtree(ckpt_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(ckpt_dir)
+    tokenizer.save_pretrained(ckpt_dir)
+    torch.save(optimizer.state_dict(), ckpt_dir / "optimizer.pt")
+    if trainer_state:
+        _save_trainer_state(ckpt_dir, trainer_state)
+    return ckpt_dir
+
+
 def _save_checkpoint(
     output_dir: Path,
     update_idx: int,
     model: AutoModelForCausalLM,
     tokenizer,
     optimizer: torch.optim.Optimizer,
+    trainer_state: dict[str, Any] | None = None,
 ) -> Path:
     ckpt_dir = output_dir / f"checkpoint-{update_idx}"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(ckpt_dir)
-    tokenizer.save_pretrained(ckpt_dir)
-    torch.save(optimizer.state_dict(), ckpt_dir / "optimizer.pt")
-    return ckpt_dir
+    return _save_checkpoint_to_dir(
+        ckpt_dir=ckpt_dir,
+        model=model,
+        tokenizer=tokenizer,
+        optimizer=optimizer,
+        trainer_state=trainer_state,
+    )
+
+
+def _save_resume_checkpoint(
+    output_dir: Path,
+    update_idx: int,
+    model: AutoModelForCausalLM,
+    tokenizer,
+    optimizer: torch.optim.Optimizer,
+    trainer_state: dict[str, Any] | None = None,
+) -> Path:
+    ckpt_dir = output_dir / "resume_latest"
+    state = dict(trainer_state or {})
+    state["update_idx"] = int(update_idx)
+    return _save_checkpoint_to_dir(
+        ckpt_dir=ckpt_dir,
+        model=model,
+        tokenizer=tokenizer,
+        optimizer=optimizer,
+        trainer_state=state,
+    )
 
 
 def _save_model_only(
@@ -663,7 +905,12 @@ def _compute_eval_selection_score(report: dict[str, Any], cfg: RLPostTrainConfig
         * float(cfg.reward.w_xcomet_seq)
         * float(cfg.reward.xcomet_seq_scale)
     )
-    return float(metricx_term + xcomet_term)
+    mqm_term = (
+        float(report.get("mqm_score_mean", 0.0))
+        * float(cfg.reward.w_mqm_seq)
+        * float(cfg.reward.mqm_seq_scale)
+    )
+    return float(metricx_term + xcomet_term + mqm_term)
 
 
 def run_metric_only_eval(cfg: RLPostTrainConfig) -> dict[str, Any]:
@@ -685,9 +932,25 @@ def run_metric_only_eval(cfg: RLPostTrainConfig) -> dict[str, Any]:
 
     eval_limit = cfg.eval.eval_limit if cfg.eval.eval_limit is not None else cfg.data.eval_limit
     eval_examples = load_examples(cfg.data, split="eval", limit=eval_limit)
+    if (
+        cfg.data.hf_dataset_name
+        and not cfg.data.eval_file
+        and (cfg.data.hf_eval_split or cfg.data.hf_train_split) == cfg.data.hf_train_split
+    ):
+        logger.warning(
+            "Eval is currently read from the same HF split as train (%s). "
+            "For SFT eval-set selection, set data.eval_file (recommended) or data.hf_eval_split to a distinct split.",
+            cfg.data.hf_train_split,
+        )
+
+    if not (cfg.reward.mqm.source_lang or "").strip():
+        cfg.reward.mqm.source_lang = cfg.data.default_src_lang
+    if not (cfg.reward.mqm.target_lang or "").strip():
+        cfg.reward.mqm.target_lang = cfg.data.default_tgt_lang
 
     metricx_scorer = MetricXQEScorer(cfg.reward.metricx) if cfg.reward.metricx.enabled else None
     xcomet_scorer = XCometXLScorer(cfg.reward.xcomet) if cfg.reward.xcomet.enabled else None
+    mqm_scorer = OpenAICompatibleMQMScorer(cfg.reward.mqm) if cfg.reward.mqm.enabled else None
 
     report = evaluate_on_dataset(
         examples=eval_examples,
@@ -697,6 +960,7 @@ def run_metric_only_eval(cfg: RLPostTrainConfig) -> dict[str, Any]:
         device=device,
         metricx_scorer=metricx_scorer,
         xcomet_scorer=xcomet_scorer,
+        mqm_scorer=mqm_scorer,
     )
     logger.info("Eval report: %s", report)
     return report
@@ -716,12 +980,45 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     dump_config(cfg, output_dir / "resolved_config.yaml")
 
+    log_path = output_dir / cfg.logging.jsonl_name
+    rollout_log_path = output_dir / cfg.logging.rollout_jsonl_name
+    eval_output_path = output_dir / cfg.logging.eval_output_jsonl_name
+
+    resume_ckpt, resume_update_idx = _resolve_resume_checkpoint(cfg, output_dir)
+    resume_state = _load_trainer_state(resume_ckpt) if resume_ckpt is not None else None
+    if resume_state and "update_idx" in resume_state:
+        try:
+            resume_update_idx = int(resume_state["update_idx"])
+        except (TypeError, ValueError):
+            pass
+    is_resuming = resume_ckpt is not None
+    start_update = resume_update_idx + 1 if is_resuming else 1
+
+    if log_path.exists() and not is_resuming:
+        log_path.unlink()
+    if cfg.logging.save_rollouts and rollout_log_path.exists() and not is_resuming:
+        rollout_log_path.unlink()
+    if cfg.logging.save_eval_outputs and eval_output_path.exists() and not is_resuming:
+        eval_output_path.unlink()
+    if is_resuming:
+        _truncate_jsonl_by_update(log_path, resume_update_idx)
+        if cfg.logging.save_rollouts:
+            _truncate_jsonl_by_update(rollout_log_path, resume_update_idx)
+        if cfg.logging.save_eval_outputs:
+            _truncate_jsonl_by_update(eval_output_path, resume_update_idx)
+
     tokenizer_name = cfg.model.tokenizer_name_or_path or cfg.model.policy_name_or_path
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=cfg.model.use_fast_tokenizer)
+    tokenizer_source = (
+        str(resume_ckpt)
+        if resume_ckpt is not None and (resume_ckpt / "tokenizer_config.json").exists()
+        else tokenizer_name
+    )
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=cfg.model.use_fast_tokenizer)
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    policy_model = _load_policy_model(cfg, device=device)
+    policy_source = str(resume_ckpt) if resume_ckpt is not None else cfg.model.policy_name_or_path
+    policy_model = _load_policy_model(cfg, device=device, model_name_or_path=policy_source)
     ref_model, ref_device = _load_reference_model(cfg, default_device=device)
 
     train_examples = load_examples(cfg.data, split="train", limit=cfg.data.limit)
@@ -730,9 +1027,25 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
 
     eval_limit = cfg.eval.eval_limit if cfg.eval.eval_limit is not None else cfg.data.eval_limit
     eval_examples = load_examples(cfg.data, split="eval", limit=eval_limit)
+    if (
+        cfg.data.hf_dataset_name
+        and not cfg.data.eval_file
+        and (cfg.data.hf_eval_split or cfg.data.hf_train_split) == cfg.data.hf_train_split
+    ):
+        logger.warning(
+            "Eval is currently read from the same HF split as train (%s). "
+            "For SFT eval-set selection, set data.eval_file (recommended) or data.hf_eval_split to a distinct split.",
+            cfg.data.hf_train_split,
+        )
+
+    if not (cfg.reward.mqm.source_lang or "").strip():
+        cfg.reward.mqm.source_lang = cfg.data.default_src_lang
+    if not (cfg.reward.mqm.target_lang or "").strip():
+        cfg.reward.mqm.target_lang = cfg.data.default_tgt_lang
 
     metricx_scorer = MetricXQEScorer(cfg.reward.metricx) if cfg.reward.metricx.enabled else None
     xcomet_scorer = XCometXLScorer(cfg.reward.xcomet) if cfg.reward.xcomet.enabled else None
+    mqm_scorer = OpenAICompatibleMQMScorer(cfg.reward.mqm) if cfg.reward.mqm.enabled else None
 
     optimizer = torch.optim.AdamW(
         [p for p in policy_model.parameters() if p.requires_grad],
@@ -740,25 +1053,66 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         weight_decay=cfg.rl.weight_decay,
     )
 
-    log_path = output_dir / cfg.logging.jsonl_name
-    if log_path.exists():
-        log_path.unlink()
-    rollout_log_path = output_dir / cfg.logging.rollout_jsonl_name
-    if cfg.logging.save_rollouts and rollout_log_path.exists():
-        rollout_log_path.unlink()
-    eval_output_path = output_dir / cfg.logging.eval_output_jsonl_name
-    if cfg.logging.save_eval_outputs and eval_output_path.exists():
-        eval_output_path.unlink()
+    if is_resuming:
+        optimizer_path = resume_ckpt / "optimizer.pt"
+        if optimizer_path.exists():
+            optimizer_state = torch.load(optimizer_path, map_location="cpu")
+            optimizer.load_state_dict(optimizer_state)
+        else:
+            logger.warning("Resume checkpoint has no optimizer.pt: %s", resume_ckpt)
 
     artifacts: dict[str, Any] = {
         "output_dir": str(output_dir),
         "checkpoints": [],
     }
+    if is_resuming and resume_ckpt is not None:
+        artifacts["resumed_from"] = str(resume_ckpt)
+        artifacts["resume_update"] = resume_update_idx
+
     best_dir = output_dir / "best"
     best_eval_score = float("-inf")
     best_eval_update: int | None = None
 
-    if cfg.eval.run_before_train and eval_examples:
+    if is_resuming:
+        if resume_state:
+            score_raw = resume_state.get("best_eval_score")
+            update_raw = resume_state.get("best_eval_update")
+            try:
+                score = float(score_raw)
+            except (TypeError, ValueError):
+                score = float("-inf")
+            try:
+                update = int(update_raw) if update_raw is not None else None
+            except (TypeError, ValueError):
+                update = None
+            if math.isfinite(score):
+                best_eval_score = score
+                best_eval_update = update
+
+        if log_path.exists():
+            log_best_score, log_best_update = _restore_best_from_log(log_path)
+            if log_best_update is not None and (
+                best_eval_update is None or log_best_score > best_eval_score
+            ):
+                best_eval_score = log_best_score
+                best_eval_update = log_best_update
+
+        logger.info(
+            "Resuming training from %s (resume_update=%s, start_update=%s, best_eval_update=%s, best_eval_score=%s)",
+            resume_ckpt,
+            resume_update_idx,
+            start_update,
+            best_eval_update,
+            best_eval_score if math.isfinite(best_eval_score) else None,
+        )
+
+    if cfg.logging.save_only_best and cfg.logging.save_every_n_updates <= 0:
+        logger.warning(
+            "logging.save_only_best=true with logging.save_every_n_updates<=0: "
+            "resume checkpoints will not be written during training."
+        )
+
+    if cfg.eval.run_before_train and eval_examples and start_update <= 1:
         report = evaluate_on_dataset(
             examples=eval_examples,
             policy_model=policy_model,
@@ -767,6 +1121,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             device=device,
             metricx_scorer=metricx_scorer,
             xcomet_scorer=xcomet_scorer,
+            mqm_scorer=mqm_scorer,
             collect_outputs=cfg.logging.save_eval_outputs,
         )
         eval_select_score = _compute_eval_selection_score(report, cfg)
@@ -780,9 +1135,15 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             best_eval_score = eval_select_score
             best_eval_update = 0
             logger.info("new best eval at update=%s score=%.6f", 0, eval_select_score)
+    elif cfg.eval.run_before_train and eval_examples and start_update > 1:
+        logger.info(
+            "Skipping run_before_train eval because training is resumed from update=%s.",
+            start_update - 1,
+        )
 
     metricx_cache: dict[tuple[str, str, str], float] = {}
     xcomet_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]] = {}
+    mqm_cache: dict[tuple[str, str, str], float] = {}
     rng = random.Random(cfg.misc.seed)
     train_indices = list(range(len(train_examples)))
     rng.shuffle(train_indices)
@@ -796,7 +1157,14 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
         cfg.rl.updates,
     )
 
-    for update_idx in range(1, cfg.rl.updates + 1):
+    if start_update > cfg.rl.updates:
+        logger.info(
+            "Nothing to train: start_update=%s exceeds configured updates=%s.",
+            start_update,
+            cfg.rl.updates,
+        )
+
+    for update_idx in range(start_update, cfg.rl.updates + 1):
         if train_cursor >= len(train_indices):
             rng.shuffle(train_indices)
             train_cursor = 0
@@ -823,8 +1191,10 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             cfg=cfg,
             metricx_scorer=metricx_scorer,
             xcomet_scorer=xcomet_scorer,
+            mqm_scorer=mqm_scorer,
             metricx_cache=metricx_cache,
             xcomet_cache=xcomet_cache,
+            mqm_cache=mqm_cache,
         )
 
         step_stats = []
@@ -869,7 +1239,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             )
 
         logger.info(
-            "update=%s loss=%.6f len=%.2f metricx=%.4f±%.4f xcomet=%.4f±%.4f token_nonzero=%.4f A(raw)=%.4f/%.4f A(norm)=%.4f/%.4f",
+            "update=%s loss=%.6f len=%.2f metricx=%.4f±%.4f xcomet=%.4f±%.4f mqm=%.4f±%.4f token_nonzero=%.4f A(raw)=%.4f/%.4f A(norm)=%.4f/%.4f",
             update_idx,
             train_stats.policy_loss,
             payload["rollout_avg_completion_len"],
@@ -877,6 +1247,8 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             payload["metricx_score_std"],
             payload["xcomet_score_mean"],
             payload["xcomet_score_std"],
+            payload["mqm_score_mean"],
+            payload["mqm_score_std"],
             payload["token_rewards_non_zero_ratio"],
             payload["adv_raw_mean"],
             payload["adv_raw_std"],
@@ -884,9 +1256,33 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
             payload["adv_norm_std"],
         )
 
+        trainer_state_payload = {
+            "update_idx": int(update_idx),
+            "best_eval_update": int(best_eval_update) if best_eval_update is not None else None,
+            "best_eval_score": float(best_eval_score) if math.isfinite(best_eval_score) else None,
+        }
+
         if cfg.logging.save_every_n_updates > 0 and update_idx % cfg.logging.save_every_n_updates == 0:
-            ckpt = _save_checkpoint(output_dir, update_idx, policy_model, tokenizer, optimizer)
-            artifacts["checkpoints"].append(str(ckpt))
+            if cfg.logging.save_only_best:
+                resume_path = _save_resume_checkpoint(
+                    output_dir=output_dir,
+                    update_idx=update_idx,
+                    model=policy_model,
+                    tokenizer=tokenizer,
+                    optimizer=optimizer,
+                    trainer_state=trainer_state_payload,
+                )
+                artifacts["resume_checkpoint"] = str(resume_path)
+            else:
+                ckpt = _save_checkpoint(
+                    output_dir=output_dir,
+                    update_idx=update_idx,
+                    model=policy_model,
+                    tokenizer=tokenizer,
+                    optimizer=optimizer,
+                    trainer_state=trainer_state_payload,
+                )
+                artifacts["checkpoints"].append(str(ckpt))
 
         if (
             cfg.eval.eval_every_n_updates > 0
@@ -901,6 +1297,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
                 device=device,
                 metricx_scorer=metricx_scorer,
                 xcomet_scorer=xcomet_scorer,
+                mqm_scorer=mqm_scorer,
                 collect_outputs=cfg.logging.save_eval_outputs,
             )
             eval_select_score = _compute_eval_selection_score(report, cfg)

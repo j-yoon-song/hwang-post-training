@@ -38,6 +38,10 @@ class DataConfig:
     eval_split: str | None = None
     limit: int | None = None
     eval_limit: int | None = None
+    eval_sampling_count: int | None = None
+    eval_sampling_ratio: float | None = None
+    eval_sampling_seed: int = 42
+    eval_sampling_min_samples: int = 1
 
     id_field: str = "id"
     src_text_field: str = "src_text"
@@ -95,10 +99,37 @@ class XCometConfig:
 
 
 @dataclass
+class MQMConfig:
+    enabled: bool = False
+    base_url: str | None = None
+    model_name: str = "qwen3.5-397b-instruct"
+    api_key: str | None = None
+    api_key_env: str = "OPENAI_API_KEY"
+    source_lang: str = "English"
+    target_lang: str = "Korean"
+    timeout_sec: float = 120.0
+    timeout_s: float | None = None
+    max_retries: int = 3
+    batch_size: int = 1
+    use_reference: bool = False
+    temperature: float = 0.0
+    top_p: float = 1.0
+    max_tokens: int = 1024
+    stop: list[str] = field(default_factory=list)
+    chat_template_kwargs: dict[str, Any] = field(default_factory=lambda: {"enable_thinking": False})
+    score_min: float = -25.0
+    score_max: float = 0.0
+    scale_to_unit_interval: bool = False
+    error_policy: str = "raise"  # raise|zero
+
+
+@dataclass
 class RewardConfig:
     w_metricx: float = 1.0
     w_xcomet_seq: float = 0.0
     xcomet_seq_scale: float = 1.0
+    w_mqm_seq: float = 0.0
+    mqm_seq_scale: float = 1.0
     severity_weights: dict[str, float] = field(
         default_factory=lambda: {
             "MINOR": -1.0,
@@ -114,6 +145,7 @@ class RewardConfig:
 
     metricx: MetricXConfig = field(default_factory=MetricXConfig)
     xcomet: XCometConfig = field(default_factory=XCometConfig)
+    mqm: MQMConfig = field(default_factory=MQMConfig)
 
 
 @dataclass
@@ -151,6 +183,9 @@ class LoggingConfig:
     eval_output_jsonl_name: str = "eval_outputs.jsonl"
     save_eval_outputs: bool = False
     save_every_n_updates: int = 10
+    save_only_best: bool = False
+    auto_resume: bool = True
+    resume_from_checkpoint: str | None = None
 
 
 @dataclass
@@ -256,6 +291,8 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
     if use_hf_dataset:
         if not cfg.data.hf_train_split.strip():
             raise ValueError("data.hf_train_split must not be empty when data.hf_dataset_name is set.")
+        if cfg.data.eval_file and not Path(cfg.data.eval_file).exists():
+            raise FileNotFoundError(f"data.eval_file not found: {cfg.data.eval_file}")
     else:
         if not cfg.data.train_file or not Path(cfg.data.train_file).exists():
             raise FileNotFoundError(f"data.train_file not found: {cfg.data.train_file}")
@@ -275,8 +312,33 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("reward.overlap_policy must be any_overlap or majority_overlap")
     if cfg.reward.span_combine_policy not in {"sum", "min", "max"}:
         raise ValueError("reward.span_combine_policy must be sum|min|max")
-    if not cfg.reward.metricx.enabled and not cfg.reward.xcomet.enabled:
+    if not cfg.reward.metricx.enabled and not cfg.reward.xcomet.enabled and not cfg.reward.mqm.enabled:
         raise ValueError("At least one reward model must be enabled.")
+    if cfg.reward.mqm.error_policy not in {"raise", "zero"}:
+        raise ValueError("reward.mqm.error_policy must be raise|zero")
+    if cfg.reward.mqm.enabled:
+        if not cfg.reward.mqm.base_url or not str(cfg.reward.mqm.base_url).strip():
+            raise ValueError("reward.mqm.base_url must be set when reward.mqm.enabled=true")
+        if float(cfg.reward.mqm.score_max) <= float(cfg.reward.mqm.score_min):
+            raise ValueError("reward.mqm.score_max must be greater than reward.mqm.score_min")
+        if int(cfg.reward.mqm.max_retries) < 0:
+            raise ValueError("reward.mqm.max_retries must be >= 0")
+        if float(cfg.reward.mqm.timeout_s or cfg.reward.mqm.timeout_sec) <= 0:
+            raise ValueError("reward.mqm.timeout_s/timeout_sec must be > 0")
+        if int(cfg.reward.mqm.batch_size) <= 0:
+            raise ValueError("reward.mqm.batch_size must be > 0")
+        if not isinstance(cfg.reward.mqm.stop, list):
+            raise ValueError("reward.mqm.stop must be a list")
+        if cfg.reward.mqm.chat_template_kwargs is not None and not isinstance(cfg.reward.mqm.chat_template_kwargs, dict):
+            raise ValueError("reward.mqm.chat_template_kwargs must be a dict")
+    if cfg.data.eval_sampling_count is not None:
+        if int(cfg.data.eval_sampling_count) <= 0:
+            raise ValueError("data.eval_sampling_count must be > 0 when set.")
+    if cfg.data.eval_sampling_ratio is not None and cfg.data.eval_sampling_count is None:
+        if not (0.0 < float(cfg.data.eval_sampling_ratio) < 1.0):
+            raise ValueError("data.eval_sampling_ratio must be in (0, 1) when set.")
+    if cfg.data.eval_sampling_min_samples <= 0:
+        raise ValueError("data.eval_sampling_min_samples must be > 0.")
 
     cfg.model.policy_gpu_ids = _normalize_gpu_ids(cfg.model.policy_gpu_ids, "model.policy_gpu_ids")
     cfg.model.reference_gpu_ids = _normalize_gpu_ids(cfg.model.reference_gpu_ids, "model.reference_gpu_ids")
@@ -323,6 +385,7 @@ def load_config(path: str | Path) -> RLPostTrainConfig:
     cfg.model.reference_name_or_path = _resolve_model_name_or_path(cfg.model.reference_name_or_path, base_dir)
     cfg.model.tokenizer_name_or_path = _resolve_model_name_or_path(cfg.model.tokenizer_name_or_path, base_dir)
     cfg.logging.output_dir = _resolve_optional_path(cfg.logging.output_dir, base_dir) or cfg.logging.output_dir
+    cfg.logging.resume_from_checkpoint = _resolve_optional_path(cfg.logging.resume_from_checkpoint, base_dir)
     cfg.misc.huggingface_cache_dir = _resolve_optional_path(cfg.misc.huggingface_cache_dir, base_dir)
 
     _validate_config(cfg)
