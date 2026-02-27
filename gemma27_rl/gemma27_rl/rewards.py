@@ -6,6 +6,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import re
 from textwrap import dedent
 from typing import Any, Callable
 from urllib import error as urllib_error
@@ -122,26 +123,26 @@ GEMBA_FEWSHOT_ASSISTANT_3 = dedent(
 
 
 def gemba_mqm_parse_errors(model_output: str) -> dict[str, list[str]]:
-    x = str(model_output).lower()
     errors: dict[str, list[str]] = {"critical": [], "major": [], "minor": []}
     level: str | None = None
 
-    for line in x.split("\n"):
-        line = line.strip()
-        if (not line) or ("no-error" in line) or ("no error" in line):
+    for raw_line in str(model_output).splitlines():
+        line = raw_line.strip()
+        line_l = line.lower()
+        if (not line) or ("no-error" in line_l) or ("no error" in line_l):
             continue
-        if line == "critical:":
+        if line_l == "critical:":
             level = "critical"
             continue
-        if line == "major:":
+        if line_l == "major:":
             level = "major"
             continue
-        if line == "minor:":
+        if line_l == "minor:":
             level = "minor"
             continue
         if level is None:
             continue
-        if "non-translation" in line:
+        if "non-translation" in line_l:
             errors["critical"].append(line)
         else:
             errors[level].append(line)
@@ -165,6 +166,106 @@ def gemba_mqm_score(model_output: str | None) -> int | None:
     if penalty > 25:
         penalty = 25
     return -penalty
+
+
+_MQM_QUOTED_TEXT_PATTERNS: tuple[str, ...] = (
+    r'"([^"\n]+)"',
+    r"“([^”\n]+)”",
+    r"'([^'\n]+)'",
+    r"`([^`\n]+)`",
+)
+
+
+def _extract_mqm_quoted_text(line: str) -> str | None:
+    matches: list[str] = []
+    for pattern in _MQM_QUOTED_TEXT_PATTERNS:
+        for found in re.findall(pattern, line):
+            value = str(found).strip()
+            if not value:
+                continue
+            if value.lower() in {"no-error", "no error"}:
+                continue
+            matches.append(value)
+    if not matches:
+        return None
+    return max(matches, key=len)
+
+
+def _find_text_span(
+    text: str,
+    needle: str,
+    used_spans: list[tuple[int, int]],
+) -> tuple[int, int] | None:
+    if not text or not needle:
+        return None
+
+    candidates: list[tuple[int, int]] = []
+
+    start = 0
+    while True:
+        idx = text.find(needle, start)
+        if idx < 0:
+            break
+        candidates.append((idx, idx + len(needle)))
+        start = idx + 1
+
+    if not candidates:
+        text_l = text.lower()
+        needle_l = needle.lower()
+        start = 0
+        while True:
+            idx = text_l.find(needle_l, start)
+            if idx < 0:
+                break
+            candidates.append((idx, idx + len(needle)))
+            start = idx + 1
+
+    if not candidates:
+        return None
+
+    def _overlap(span: tuple[int, int], other: tuple[int, int]) -> bool:
+        return span[0] < other[1] and other[0] < span[1]
+
+    for span in candidates:
+        if all(not _overlap(span, used) for used in used_spans):
+            return span
+    return candidates[0]
+
+
+def gemba_mqm_extract_error_spans(model_output: str | None, mt_text: str) -> list[dict[str, Any]]:
+    if model_output is None or not mt_text:
+        return []
+
+    parsed = gemba_mqm_parse_errors(model_output)
+    out: list[dict[str, Any]] = []
+    used_spans: list[tuple[int, int]] = []
+    max_items = 5
+
+    for severity in ("critical", "major", "minor"):
+        for line in parsed.get(severity, []):
+            if len(out) >= max_items:
+                return out
+            quoted = _extract_mqm_quoted_text(line)
+            if quoted is None:
+                continue
+            span = _find_text_span(mt_text, quoted, used_spans)
+            if span is None:
+                continue
+            start, end = span
+            used_spans.append(span)
+            out.append(
+                {
+                    "text": mt_text[start:end],
+                    "start": int(start),
+                    "end": int(end),
+                    "severity": severity.upper(),
+                    "confidence": 1.0,
+                    "source": "mqm",
+                    "label": line,
+                }
+            )
+
+    return out
 
 
 def _gemba_eval_user_message(
@@ -741,7 +842,7 @@ class OpenAICompatibleMQMScorer:
 
     def score_batch(self, samples: list[SampleForScoring]) -> RewardOutput:
         if not samples:
-            return RewardOutput(sequence_scores=[], metadata={"raw_outputs": []})
+            return RewardOutput(sequence_scores=[], metadata={"raw_outputs": [], "error_spans": []})
 
         message_rows = [
             build_gemba_mqm_messages(
@@ -754,21 +855,30 @@ class OpenAICompatibleMQMScorer:
         ]
         if self.predict_fn is not None:
             scores = [float(v) for v in self.predict_fn(message_rows)]
-            return RewardOutput(sequence_scores=scores, metadata={"raw_outputs": []})
+            return RewardOutput(
+                sequence_scores=scores,
+                metadata={"raw_outputs": [], "error_spans": [[] for _ in samples]},
+            )
 
         if self._chat_url is None:
             raise RuntimeError("OpenAICompatibleMQMScorer is not initialized.")
 
         sequence_scores: list[float] = []
         raw_outputs: list[str] = []
+        error_spans: list[list[dict[str, Any]]] = []
         for i in range(0, len(message_rows), max(1, int(self.cfg.batch_size))):
             batch_messages = message_rows[i : i + max(1, int(self.cfg.batch_size))]
-            for messages in batch_messages:
+            batch_samples = samples[i : i + max(1, int(self.cfg.batch_size))]
+            for sample, messages in zip(batch_samples, batch_messages):
                 score, raw_text = self._score_one_messages(messages)
                 sequence_scores.append(score)
                 raw_outputs.append(raw_text)
+                error_spans.append(gemba_mqm_extract_error_spans(raw_text, sample.mt))
 
-        return RewardOutput(sequence_scores=sequence_scores, metadata={"raw_outputs": raw_outputs})
+        return RewardOutput(
+            sequence_scores=sequence_scores,
+            metadata={"raw_outputs": raw_outputs, "error_spans": error_spans},
+        )
 
     def _score_one_messages(self, messages: list[dict[str, str]]) -> tuple[float, str]:
         retries = max(0, int(self.cfg.max_retries))

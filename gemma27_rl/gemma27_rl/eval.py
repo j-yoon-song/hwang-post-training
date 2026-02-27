@@ -109,9 +109,12 @@ def evaluate_on_dataset(
         spans = meta.get("error_spans", spans)
 
     mqm_scores = [0.0 for _ in rollouts]
+    mqm_spans: list[list[dict[str, Any]]] = [[] for _ in rollouts]
     if mqm_scorer is not None and cfg.reward.mqm.enabled:
         mqm_out = mqm_scorer.score_batch(samples)
         mqm_scores = mqm_out.sequence_scores
+        mqm_meta = mqm_out.metadata or {}
+        mqm_spans = mqm_meta.get("error_spans", mqm_spans)
         non_finite_idx = [idx for idx, value in enumerate(mqm_scores) if not math.isfinite(float(value))]
         if non_finite_idx:
             logger.warning(
@@ -120,6 +123,13 @@ def evaluate_on_dataset(
             )
             for idx in non_finite_idx:
                 mqm_scores[idx] = 0.0
+    spans = [
+        [
+            *(spans[idx] if idx < len(spans) else []),
+            *(mqm_spans[idx] if idx < len(mqm_spans) else []),
+        ]
+        for idx in range(len(rollouts))
+    ]
 
     span_counts = [len(s) for s in spans]
     severity = Counter()

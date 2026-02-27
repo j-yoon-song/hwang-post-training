@@ -235,12 +235,18 @@ def generate_rollouts(
         if use_chat_template:
             try:
                 chats = [[{"role": "user", "content": prompt}] for prompt in prompt_texts]
+                chat_kwargs = (
+                    dict(gen_cfg.chat_template_kwargs)
+                    if getattr(gen_cfg, "chat_template_kwargs", None) is not None
+                    else {}
+                )
                 tokenized = tokenizer.apply_chat_template(
                     chats,
                     tokenize=True,
                     add_generation_prompt=True,
                     return_tensors="pt",
                     padding=True,
+                    **chat_kwargs,
                 )
             except Exception as exc:
                 logger.warning("Chat template encode failed; falling back to plain prompt encode: %s", exc)

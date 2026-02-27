@@ -73,6 +73,7 @@ class GenerationConfig:
     num_samples_per_prompt: int = 2
     do_sample: bool = True
     repetition_penalty: float = 1.0
+    chat_template_kwargs: dict[str, Any] = field(default_factory=lambda: {"enable_thinking": False})
 
 
 @dataclass
@@ -308,6 +309,8 @@ def _validate_config(cfg: RLPostTrainConfig) -> None:
         raise ValueError("rl.updates must be > 0")
     if cfg.rl.algorithm not in {"grpo", "reinforce"}:
         raise ValueError("rl.algorithm must be one of: grpo, reinforce")
+    if cfg.generation.chat_template_kwargs is not None and not isinstance(cfg.generation.chat_template_kwargs, dict):
+        raise ValueError("generation.chat_template_kwargs must be a dict")
     if cfg.reward.overlap_policy not in {"any_overlap", "majority_overlap"}:
         raise ValueError("reward.overlap_policy must be any_overlap or majority_overlap")
     if cfg.reward.span_combine_policy not in {"sum", "min", "max"}:

@@ -627,29 +627,37 @@ def _score_with_cache_xcomet(
 def _score_with_cache_mqm(
     samples: list[SampleForScoring],
     scorer: OpenAICompatibleMQMScorer,
-    cache: dict[tuple[str, str, str], float],
+    cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]],
     use_cache: bool,
-) -> list[float]:
-    out = [0.0 for _ in samples]
+) -> tuple[list[float], list[list[dict[str, Any]]]]:
+    scores = [0.0 for _ in samples]
+    spans = [[] for _ in samples]
     uncached: list[SampleForScoring] = []
     uncached_idx: list[int] = []
 
     for idx, sample in enumerate(samples):
         key = (sample.src, sample.mt, (sample.ref or "") if scorer.cfg.use_reference else "")
         if use_cache and key in cache:
-            out[idx] = cache[key]
+            scores[idx], spans[idx] = cache[key]
         else:
             uncached.append(sample)
             uncached_idx.append(idx)
 
     if uncached:
-        scores = scorer.score_batch(uncached).sequence_scores
-        for idx, score, sample in zip(uncached_idx, scores, uncached):
-            out[idx] = float(score)
+        out = scorer.score_batch(uncached)
+        span_rows = (out.metadata or {}).get("error_spans", [[] for _ in uncached])
+        for idx, score, span_row, sample in zip(uncached_idx, out.sequence_scores, span_rows, uncached):
+            score_f = float(score)
+            span_list = [s for s in span_row if isinstance(s, dict)]
+            scores[idx] = score_f
+            spans[idx] = span_list
             if use_cache:
-                cache[(sample.src, sample.mt, (sample.ref or "") if scorer.cfg.use_reference else "")] = float(score)
+                cache[(sample.src, sample.mt, (sample.ref or "") if scorer.cfg.use_reference else "")] = (
+                    score_f,
+                    span_list,
+                )
 
-    return out
+    return scores, spans
 
 
 def _prepare_rewards_and_advantages(
@@ -660,7 +668,7 @@ def _prepare_rewards_and_advantages(
     mqm_scorer: OpenAICompatibleMQMScorer | None,
     metricx_cache: dict[tuple[str, str, str], float],
     xcomet_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]],
-    mqm_cache: dict[tuple[str, str, str], float],
+    mqm_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]],
 ) -> tuple[list[list[float]], dict[str, float], dict[str, float]]:
     def _sanitize(values: list[float], fallback: float) -> tuple[list[float], int]:
         out: list[float] = []
@@ -719,7 +727,7 @@ def _prepare_rewards_and_advantages(
         )
 
     if cfg.reward.mqm.enabled and mqm_scorer is not None:
-        mqm_scores = _score_with_cache_mqm(
+        mqm_scores, mqm_span_rows = _score_with_cache_mqm(
             samples=samples,
             scorer=mqm_scorer,
             cache=mqm_cache,
@@ -727,12 +735,20 @@ def _prepare_rewards_and_advantages(
         )
     else:
         mqm_scores = [0.0 for _ in rollouts]
+        mqm_span_rows = [[] for _ in rollouts]
     mqm_scores, mqm_replaced = _sanitize(mqm_scores, fallback=0.0)
     if mqm_replaced > 0:
         logger.warning(
             "MQM scorer produced %s non-finite scores; replaced with fallback 0.0.",
             mqm_replaced,
         )
+    span_rows = [
+        [
+            *(span_rows[idx] if idx < len(span_rows) else []),
+            *(mqm_span_rows[idx] if idx < len(mqm_span_rows) else []),
+        ]
+        for idx in range(len(rollouts))
+    ]
 
     seq_rewards = build_sequence_rewards(
         metricx_scores=metricx_scores,
@@ -1143,7 +1159,7 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
 
     metricx_cache: dict[tuple[str, str, str], float] = {}
     xcomet_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]] = {}
-    mqm_cache: dict[tuple[str, str, str], float] = {}
+    mqm_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]] = {}
     rng = random.Random(cfg.misc.seed)
     train_indices = list(range(len(train_examples)))
     rng.shuffle(train_indices)

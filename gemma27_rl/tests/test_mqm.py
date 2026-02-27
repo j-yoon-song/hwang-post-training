@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 from gemma27_rl.config import MQMConfig
-from gemma27_rl.rewards import OpenAICompatibleMQMScorer, gemba_mqm_parse_errors, gemba_mqm_score
+from gemma27_rl.rewards import (
+    OpenAICompatibleMQMScorer,
+    gemba_mqm_extract_error_spans,
+    gemba_mqm_parse_errors,
+    gemba_mqm_score,
+)
 from gemma27_rl.types import SampleForScoring
 
 
@@ -31,7 +36,25 @@ def test_openai_mqm_predict_fn_path() -> None:
     out = scorer.score_batch([SampleForScoring(src="hello", mt="안녕", ref=None)])
 
     assert out.sequence_scores == [-5.0]
+    assert out.metadata["error_spans"] == [[]]
     assert len(captured) == 1
     assert captured[0][-1]["role"] == "user"
     assert "hello" in captured[0][-1]["content"]
     assert "안녕" in captured[0][-1]["content"]
+
+
+def test_gemba_mqm_extract_error_spans_maps_quoted_text() -> None:
+    mt = "나는 학교에 갔다."
+    raw = """Critical:
+accuracy/mistranslation - "학교"
+Major:
+fluency/grammar - "갔다"
+Minor:
+no-error
+"""
+    spans = gemba_mqm_extract_error_spans(raw, mt)
+    assert len(spans) == 2
+    assert spans[0]["severity"] == "CRITICAL"
+    assert spans[0]["text"] == "학교"
+    assert spans[0]["start"] < spans[0]["end"]
+    assert spans[1]["severity"] == "MAJOR"
