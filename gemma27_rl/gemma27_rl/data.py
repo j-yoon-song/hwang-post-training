@@ -237,12 +237,16 @@ def load_examples(cfg: DataConfig, split: str, limit: int | None = None) -> list
         )
 
     examples: list[Example] = []
+    skipped_bad_source = 0
+    skipped_empty_source = 0
     for idx, row in enumerate(records):
         if cfg.skip_bad_source and bool(row.get(cfg.is_bad_source_field, False)):
+            skipped_bad_source += 1
             continue
 
         src = _pick_text(row, cfg.src_text_field)
         if not src:
+            skipped_empty_source += 1
             continue
 
         src_lang = _pick_text(row, cfg.src_lang_field, cfg.default_src_lang) or cfg.default_src_lang
@@ -266,5 +270,12 @@ def load_examples(cfg: DataConfig, split: str, limit: int | None = None) -> list
         if limit is not None and len(examples) >= limit:
             break
 
-    logger.info("Loaded %s examples for split=%s", len(examples), split)
+    logger.info(
+        "Loaded %s examples for split=%s (records=%s skipped_bad_source=%s skipped_empty_source=%s)",
+        len(examples),
+        split,
+        len(records),
+        skipped_bad_source,
+        skipped_empty_source,
+    )
     return examples

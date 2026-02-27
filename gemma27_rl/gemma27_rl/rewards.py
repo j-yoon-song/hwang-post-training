@@ -393,7 +393,8 @@ class MetricXQEScorer:
         if self._model is None:
             raise RuntimeError(
                 "Failed to load MetricX model after trying multiple dtypes. "
-                f"model={model_name} device={self._device} tried_dtypes={candidate_dtypes}."
+                f"model={model_name} device={self._device} tried_dtypes={candidate_dtypes}. "
+                f"last_error={last_error!r}"
             ) from last_error
 
     def _build_candidate_dtypes(self, model_name: str) -> list[Any]:
@@ -543,6 +544,16 @@ class MetricXQEScorer:
             if "dtype" in kwargs:
                 kwargs["torch_dtype"] = kwargs.pop("dtype")
             return model_cls.from_pretrained(model_name, **kwargs)
+        except Exception as exc:
+            # Some environments don't have accelerate installed, which makes
+            # `low_cpu_mem_usage=True` unavailable. Retry without it.
+            msg = str(exc).lower()
+            if "low_cpu_mem_usage" in msg or "accelerate" in msg:
+                kwargs.pop("low_cpu_mem_usage", None)
+                if "dtype" in kwargs:
+                    kwargs["torch_dtype"] = kwargs.pop("dtype")
+                return model_cls.from_pretrained(model_name, **kwargs)
+            raise
 
     def _load_tokenizer(self):
         candidates: list[str] = []

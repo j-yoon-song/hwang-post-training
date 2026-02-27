@@ -1039,7 +1039,18 @@ def run_toy_rl(cfg: RLPostTrainConfig) -> dict[str, Any]:
 
     train_examples = load_examples(cfg.data, split="train", limit=cfg.data.limit)
     if not train_examples:
-        raise ValueError("No train examples loaded.")
+        raise ValueError(
+            "No train examples loaded. "
+            f"Check data fields and filters: "
+            f"src_text_field={cfg.data.src_text_field!r}, "
+            f"id_field={cfg.data.id_field!r}, "
+            f"skip_bad_source={cfg.data.skip_bad_source}, "
+            f"is_bad_source_field={cfg.data.is_bad_source_field!r}, "
+            f"limit={cfg.data.limit}, "
+            f"hf_dataset_name={cfg.data.hf_dataset_name!r}, "
+            f"hf_train_split={cfg.data.hf_train_split!r}, "
+            f"train_file={cfg.data.train_file!r}."
+        )
 
     eval_limit = cfg.eval.eval_limit if cfg.eval.eval_limit is not None else cfg.data.eval_limit
     eval_examples = load_examples(cfg.data, split="eval", limit=eval_limit)
